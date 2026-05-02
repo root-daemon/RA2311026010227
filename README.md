@@ -92,7 +92,7 @@ bun run notification_app_be/src/server.ts
 ```bash
 curl -X POST http://localhost:3001/notifications \
   -H "Content-Type: application/json" \
-  -d '{"title":"Alert","message":"CPU high","type":"warn"}'
+  -d '{"title":"CSX Corporation","message":"CSX Corporation hiring","type":"Placement"}'
 ```
 
 ---
@@ -199,6 +199,10 @@ dp[i][w] = max(dp[i-1][w], dp[i-1][w - Duration(i)] + Impact(i))
 
 ![Create Notification](screenshots/notification_app_be/post_notification.png)
 
+**GET /notifications**
+
+![List Notifications](screenshots/notification_app_be/get_notifications.png)
+
 **GET /notifications/:id**
 
 ![Get Notification by ID](screenshots/notification_app_be/get_notification_by_id.png)
@@ -209,11 +213,23 @@ dp[i][w] = max(dp[i-1][w], dp[i-1][w - Duration(i)] + Impact(i))
 
 **DELETE /notifications/:id**
 
-![Delete Notification](screenshots/notification_app_be/delete_notification.png)
+![Delete Notification](screenshots/notification_app_be/delete_notifications.png)
+
+**GET /notifications/priority**
+
+![Priority Inbox](screenshots/notification_app_be/get_priority_inbox.png)
 
 ---
 
 ### vehicle_maintenance_scheduler
+
+**GET /schedule**
+
+![Schedule All Depots](screenshots/vehicle_maintenance_scheduler/get_schedule.png)
+
+**GET /schedule/:depotId**
+
+![Schedule Single Depot](screenshots/vehicle_maintenance_scheduler/get_schedule_depot.png)
 
 **POST /vehicles**
 
