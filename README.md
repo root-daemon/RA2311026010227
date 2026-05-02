@@ -10,7 +10,7 @@ A backend system built with **Bun**, **Elysia.js**, and **TypeScript**, structur
 - **Framework:** Elysia.js
 - **Language:** TypeScript
 - **Architecture:** Layered (Controller → Service → Store)
-- **Persistence:** In-memory store
+- **Algorithm:** 0/1 Knapsack (Dynamic Programming) — O(n × W)
 
 ---
 
@@ -20,10 +20,10 @@ A backend system built with **Bun**, **Elysia.js**, and **TypeScript**, structur
 RA2311026010227/
 ├── logging_middleware/           Reusable Log() package (@local/logging-middleware)
 ├── notification_app_be/          Notification REST API — port 3001
-├── vehicle_maintenance_scheduler/ Vehicle cron scheduler — port 3002
-├── notification_system_design.md  System architecture document
+├── vehicle_maintenance_scheduler/ Optimization microservice — port 3002
+├── notification_system_design.md  System architecture + algorithm design
 ├── scripts/
-│   ├── register.ts               One-time registration helper
+│   ├── register.ts               One-time registration
 │   └── auth.ts                   Fetch access token
 └── screenshots/                  API screenshots
 ```
@@ -40,18 +40,18 @@ bun install
 
 ## Environment
 
-Copy `.env.example` to `.env` and fill in your credentials, then run:
+Copy `.env.example` to `.env` and fill in credentials, then:
 
 ```bash
-bun scripts/register.ts   # get clientID + clientSecret
-bun scripts/auth.ts       # get access token
+bun scripts/register.ts   # → save clientID + clientSecret to .env
+bun scripts/auth.ts       # → save access_token to .env
 ```
 
 ---
 
 ## Logging Middleware
 
-Located in `logging_middleware/`. Exported as `@local/logging-middleware` across the workspace.
+Shared across both services. Every call POSTs a structured log to the evaluation API.
 
 ```typescript
 import { Log } from "@local/logging-middleware";
@@ -59,12 +59,8 @@ import { Log } from "@local/logging-middleware";
 await Log("backend", "info", "controller", "Fetching all notifications");
 ```
 
-Every call sends a structured log to the evaluation API:
-
-```http
-POST http://20.207.122.201/evaluation-service/logs
-Authorization: Bearer <token>
-
+**Request format:**
+```json
 {
   "stack": "backend",
   "level": "info",
@@ -73,25 +69,13 @@ Authorization: Bearer <token>
 }
 ```
 
-**Allowed values:**
-
-| Parameter | Values |
-|-----------|--------|
-| `stack` | `backend`, `frontend` |
-| `level` | `debug`, `info`, `warn`, `error`, `fatal` |
-| `package` | `cache`, `controller`, `cron_job`, `db`, `domain`, `handler`, `repository`, `route`, `service`, `auth`, `config`, `middleware`, `utils` |
-
 ---
 
-## Service 1 — notification_app_be
+## Service 1 — notification_app_be (port 3001)
 
 ```bash
 bun run notification_app_be/src/server.ts
-# or
-bun --cwd notification_app_be run dev
 ```
-
-Runs on `http://localhost:3001`
 
 ### Endpoints
 
@@ -103,86 +87,89 @@ Runs on `http://localhost:3001`
 | `PATCH` | `/notifications/:id/read` | Mark as read |
 | `DELETE` | `/notifications/:id` | Delete |
 
-### Notification Schema
+### Example
 
-```json
-{
-  "id": "uuid",
-  "title": "string",
-  "message": "string",
-  "type": "info | warn | error",
-  "read": false,
-  "createdAt": "ISO 8601"
-}
-```
-
-### Example — Create Notification
-
-**Request**
-```http
-POST http://localhost:3001/notifications
-Content-Type: application/json
-
-{
-  "title": "System Alert",
-  "message": "CPU usage above 80%",
-  "type": "warn"
-}
-```
-
-**Response** `201 Created`
-```json
-{
-  "id": "63ad7a65-4e03-4d11-b72e-ca6e27c849d5",
-  "title": "System Alert",
-  "message": "CPU usage above 80%",
-  "type": "warn",
-  "read": false,
-  "createdAt": "2026-05-02T05:11:14.208Z"
-}
+```bash
+curl -X POST http://localhost:3001/notifications \
+  -H "Content-Type: application/json" \
+  -d '{"title":"Alert","message":"CPU high","type":"warn"}'
 ```
 
 ---
 
-## Service 2 — vehicle_maintenance_scheduler
+## Service 2 — vehicle_maintenance_scheduler (port 3002)
 
 ```bash
 bun run vehicle_maintenance_scheduler/src/server.ts
-# or
-bun --cwd vehicle_maintenance_scheduler run dev
 ```
 
-Runs on `http://localhost:3002`
-
-### Endpoints
+### Schedule Endpoints (core)
 
 | Method | Route | Description |
 |--------|-------|-------------|
-| `POST` | `/vehicles` | Add a vehicle |
-| `GET` | `/vehicles` | List all vehicles |
+| `GET` | `/schedule` | Fetch live depots + tasks, run knapsack for all depots |
+| `GET` | `/schedule/:depotId` | Run knapsack for a specific depot |
+
+### Vehicle Endpoints (utility)
+
+| Method | Route | Description |
+|--------|-------|-------------|
+| `POST` | `/vehicles` | Add a vehicle to the in-memory tracker |
+| `GET` | `/vehicles` | List all tracked vehicles |
 | `PUT` | `/vehicles/:id/service` | Record a service (resets `lastServiceDate` to today) |
 
-### Vehicle Schema
+### How it works
+
+1. Fetches depots from `GET /evaluation-service/depots` (live, authenticated)
+2. Fetches tasks from `GET /evaluation-service/vehicles` (live, authenticated)
+3. For each depot, runs **0/1 Knapsack DP** — maximizes `Impact` within `MechanicHours`
+4. Returns the optimal task selection per depot
+
+### Response example
 
 ```json
 {
-  "id": "uuid",
-  "name": "string",
-  "plateNumber": "string",
-  "lastServiceDate": "YYYY-MM-DD",
-  "serviceIntervalDays": "number"
+  "depotId": 2,
+  "mechanicHours": 135,
+  "totalImpact": 187,
+  "totalDuration": 134,
+  "selectedTasks": [
+    { "TaskID": "uuid", "Duration": 4, "Impact": 7 },
+    { "TaskID": "uuid", "Duration": 5, "Impact": 10 }
+  ]
 }
 ```
 
-### Cron Job
+### Cron job
 
-Runs every minute. Checks all vehicles and logs a `warn` for any vehicle whose next service date falls within 7 days.
+Runs every minute. Logs a warning for any vehicle due for maintenance within 7 days.
 
 ```
 [cron] Maintenance check running at 2026-05-02T05:34:00.027Z
 [cron] WARN: Vehicle Ambulance 01 (TN01AA1234) is due for maintenance
 [cron] Maintenance check complete
 ```
+
+---
+
+## Algorithm — 0/1 Knapsack
+
+```
+Maximize: Σ Impact(i) × x(i)
+Subject to: Σ Duration(i) × x(i) ≤ MechanicHours
+Where: x(i) ∈ {0, 1}
+```
+
+**DP recurrence:**
+```
+dp[i][w] = max(dp[i-1][w], dp[i-1][w - Duration(i)] + Impact(i))
+```
+
+| Metric | Value |
+|--------|-------|
+| Time complexity | O(n × W) |
+| Space complexity | O(n × W) |
+| vs brute-force | O(2^n) → infeasible at n=40 |
 
 ---
 
