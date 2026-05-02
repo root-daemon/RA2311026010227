@@ -1,0 +1,434 @@
+type: collection.insomnia.rest/5.0
+schema_version: "5.1"
+name: My first collection
+meta:
+  id: wrk_3bc637bb3cb149c8bff648943f87aa81
+  created: 1777698980569
+  modified: 1777698980569
+  description: ""
+collection:
+  - url: http://20.207.122.201/evaluation-service/register
+    name: Register
+    meta:
+      id: req_c2c88df7a74045b1bc0b87b528d13ff5
+      created: 1777698980590
+      modified: 1777699208845
+      isPrivate: false
+      description: ""
+      sortKey: -1777698980590
+    method: POST
+    body:
+      mimeType: application/json
+      text: |-
+        {
+        	   "email": "ss7921@srmist.edu.in",
+            "name": "SRIVISHAL S",
+            "mobileNo": "9344383408",
+            "githubUsername": "root-daemon",
+            "rollNo": "RA2311026010227",
+            "accessCode": "QkbpxH"
+        }
+    headers:
+      - name: Content-Type
+        value: application/json
+      - name: User-Agent
+        value: insomnia/12.5.0
+        description: ""
+        disabled: false
+    settings:
+      renderRequestBody: true
+      encodeUrl: true
+      followRedirects: global
+      cookies:
+        send: true
+        store: true
+      rebuildPath: true
+  - url: http://20.207.122.201/evaluation-service/auth
+    name: Auth
+    meta:
+      id: req_b307ee6d375446be93c4333b60774b78
+      created: 1777699213097
+      modified: 1777699264214
+      isPrivate: false
+      description: ""
+      sortKey: -1777699213097
+    method: POST
+    body:
+      mimeType: application/json
+      text: |2
+         {
+            "email": "ss7921@srmist.edu.in",
+            "name": "SRIVISHAL S",
+            "rollNo": "RA2311026010227",
+            "accessCode": "QkbpxH",
+            "clientID": "5303933f-e9ee-42c3-83c7-238c085b4e11",
+            "clientSecret": "jnDFdWqEDMHRtVDp"
+          }
+    headers:
+      - name: Content-Type
+        value: application/json
+      - name: User-Agent
+        value: insomnia/12.5.0
+        description: ""
+        disabled: false
+    settings:
+      renderRequestBody: true
+      encodeUrl: true
+      followRedirects: global
+      cookies:
+        send: true
+        store: true
+      rebuildPath: true
+  - url: http://20.207.122.201/evaluation-service/logs
+    name: Logging Middleware
+    meta:
+      id: req_ddf20b26e55b43b7904119d45234e5ee
+      created: 1777699353335
+      modified: 1777699413925
+      isPrivate: false
+      description: ""
+      sortKey: -1777699353335
+    method: POST
+    body:
+      mimeType: application/json
+      text: |2-
+          {
+            "stack": "backend",
+            "level": "info",
+            "package": "handler",
+            "message": "logging middleware test"
+          }
+    headers:
+      - name: Content-Type
+        value: application/json
+      - name: User-Agent
+        value: insomnia/12.5.0
+        description: ""
+        disabled: false
+    authentication:
+      type: bearer
+      token: eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJNYXBDbGFpbXMiOnsiYXVkIjoiaHR0cDovLzIwLjI0NC41Ni4xNDQvZXZhbHVhdGlvbi1zZXJ2aWNlIiwiZW1haWwiOiJzczc5MjFAc3JtaXN0LmVkdS5pbiIsImV4cCI6MTc3NzcwMDE2NywiaWF0IjoxNzc3Njk5MjY3LCJpc3MiOiJBZmZvcmQgTWVkaWNhbCBUZWNobm9sb2dpZXMgUHJpdmF0ZSBMaW1pdGVkIiwianRpIjoiZjAyZTJjYzItYTc3MS00Nzc1LWI4MTQtNzI1MGE2NWEzMGExIiwibG9jYWxlIjoiZW4tSU4iLCJuYW1lIjoic3JpdmlzaGFsIHMiLCJzdWIiOiI1MzAzOTMzZi1lOWVlLTQyYzMtODNjNy0yMzhjMDg1YjRlMTEifSwiZW1haWwiOiJzczc5MjFAc3JtaXN0LmVkdS5pbiIsIm5hbWUiOiJzcml2aXNoYWwgcyIsInJvbGxObyI6InJhMjMxMTAyNjAxMDIyNyIsImFjY2Vzc0NvZGUiOiJRa2JweEgiLCJjbGllbnRJRCI6IjUzMDM5MzNmLWU5ZWUtNDJjMy04M2M3LTIzOGMwODViNGUxMSIsImNsaWVudFNlY3JldCI6ImpuREZkV3FFRE1IUnRWRHAifQ.qjjcXrP7v1i5efpv7AFBPIc_oQTi_unAF_Ss67JRvTk
+    settings:
+      renderRequestBody: true
+      encodeUrl: true
+      followRedirects: global
+      cookies:
+        send: true
+        store: true
+      rebuildPath: true
+  - name: Notifcations
+    meta:
+      id: fld_84dbf0dd879040eca3ab029a4983591a
+      created: 1777700132413
+      modified: 1777700132413
+      sortKey: -1777700132413
+      description: ""
+    children:
+      - url: http://localhost:3001/notifications
+        name: Post Notifications
+        meta:
+          id: req_b0673113ecad4febbdd62501757c4e32
+          created: 1777699507926
+          modified: 1777703234839
+          isPrivate: false
+          description: ""
+          sortKey: -1777700136884
+        method: POST
+        body:
+          mimeType: application/json
+          text: >2-
+             {
+                "title":"CSX Corporation 3","message":"CSX Corporation hiring","type":"Placement"
+              }
+        headers:
+          - name: Content-Type
+            value: application/json
+          - name: User-Agent
+            value: insomnia/12.5.0
+            description: ""
+            disabled: false
+        settings:
+          renderRequestBody: true
+          encodeUrl: true
+          followRedirects: global
+          cookies:
+            send: true
+            store: true
+          rebuildPath: true
+      - url: http://localhost:3001/notifications
+        name: Get Notifcations
+        meta:
+          id: req_875247c35e844d0eb1d9266df7a7cbff
+          created: 1777699708400
+          modified: 1777702730829
+          isPrivate: false
+          description: ""
+          sortKey: -1777700136584
+        method: GET
+        headers:
+          - name: User-Agent
+            value: insomnia/12.5.0
+            description: ""
+            disabled: false
+        settings:
+          renderRequestBody: true
+          encodeUrl: true
+          followRedirects: global
+          cookies:
+            send: true
+            store: true
+          rebuildPath: true
+      - url: http://localhost:3001/notifications/7c8ecd2c-732f-4dfb-9abf-ceeb4594e8de/read
+        name: Mark Notifcation as Read
+        meta:
+          id: req_a145c1057c494ca7ab9f8d45cb695dbd
+          created: 1777699795841
+          modified: 1777702821238
+          isPrivate: false
+          description: ""
+          sortKey: -1777700136784
+        method: PATCH
+        headers:
+          - name: User-Agent
+            value: insomnia/12.5.0
+            description: ""
+            disabled: false
+        settings:
+          renderRequestBody: true
+          encodeUrl: true
+          followRedirects: global
+          cookies:
+            send: true
+            store: true
+          rebuildPath: true
+      - url: http://localhost:3001/notifications/7c8ecd2c-732f-4dfb-9abf-ceeb4594e8de
+        name: Delete Notifications by id
+        meta:
+          id: req_f9ab99482df14d8bb33cf04f25387b90
+          created: 1777699893462
+          modified: 1777702868790
+          isPrivate: false
+          description: ""
+          sortKey: -1777700136684
+        method: DELETE
+        headers:
+          - name: User-Agent
+            value: insomnia/12.5.0
+            description: ""
+            disabled: false
+        settings:
+          renderRequestBody: true
+          encodeUrl: true
+          followRedirects: global
+          cookies:
+            send: true
+            store: true
+          rebuildPath: true
+      - url: http://localhost:3001/notifications/7c8ecd2c-732f-4dfb-9abf-ceeb4594e8de
+        name: Get Notifcations by id
+        meta:
+          id: req_44a4a5e1bd6a4f88b43113888247acb7
+          created: 1777702736041
+          modified: 1777702778094
+          isPrivate: false
+          description: ""
+          sortKey: -1777699744959.5
+        method: GET
+        headers:
+          - name: User-Agent
+            value: insomnia/12.5.0
+            description: ""
+            disabled: false
+        settings:
+          renderRequestBody: true
+          encodeUrl: true
+          followRedirects: global
+          cookies:
+            send: true
+            store: true
+          rebuildPath: true
+      - url: http://localhost:3001/notifications/priority?n=10
+        name: Get Notifcations by Priority
+        meta:
+          id: req_d5e6b503a1cb4795a39a7924099e06d3
+          created: 1777702905906
+          modified: 1777703257615
+          isPrivate: false
+          description: ""
+          sortKey: -1777699940771.75
+        method: GET
+        headers:
+          - name: User-Agent
+            value: insomnia/12.5.0
+            description: ""
+            disabled: false
+        settings:
+          renderRequestBody: true
+          encodeUrl: true
+          followRedirects: global
+          cookies:
+            send: true
+            store: true
+          rebuildPath: true
+  - name: Vechile Maintance
+    meta:
+      id: fld_540bfacbf54b446ba20a35b5b13207e3
+      created: 1777700152228
+      modified: 1777700152228
+      sortKey: -1777700152228
+      description: ""
+    children:
+      - url: http://localhost:3002/vehicles
+        name: Get Vehicle
+        meta:
+          id: req_fba6f4ea074d4cef91c882f4aa78e76b
+          created: 1777700154823
+          modified: 1777700370420
+          isPrivate: false
+          description: ""
+          sortKey: -1777700154823
+        method: GET
+        body:
+          mimeType: application/json
+          text: ""
+        headers:
+          - name: Content-Type
+            value: application/json
+          - name: User-Agent
+            value: insomnia/12.5.0
+            description: ""
+            disabled: false
+        settings:
+          renderRequestBody: true
+          encodeUrl: true
+          followRedirects: global
+          cookies:
+            send: true
+            store: true
+          rebuildPath: true
+      - url: http://localhost:3002/vehicles
+        name: Create Vehicle.png
+        meta:
+          id: req_3aacc872373044b69ef7722712f45e18
+          created: 1777700333931
+          modified: 1777700396170
+          isPrivate: false
+          description: ""
+          sortKey: -1777700145853.5
+        method: POST
+        body:
+          mimeType: application/json
+          text: |2-
+              {
+                "name": "Ambulance 03",
+                "plateNumber": "TN01AB0103",
+                "lastServiceDate": "2024-01-01",
+                "serviceIntervalDays": 90
+              }
+        headers:
+          - name: Content-Type
+            value: application/json
+          - name: User-Agent
+            value: insomnia/12.5.0
+            description: ""
+            disabled: false
+        settings:
+          renderRequestBody: true
+          encodeUrl: true
+          followRedirects: global
+          cookies:
+            send: true
+            store: true
+          rebuildPath: true
+      - url: http://localhost:3002/vehicles/662cc285-3a7b-467d-a7b1-fdcba6f13893/service
+        name: Service Vechile
+        meta:
+          id: req_020880f58d9b41d888e4ea826e73cc14
+          created: 1777700499119
+          modified: 1777700570734
+          isPrivate: false
+          description: ""
+          sortKey: -1777700499119
+        method: PUT
+        headers:
+          - name: User-Agent
+            value: insomnia/12.5.0
+            description: ""
+            disabled: false
+        settings:
+          renderRequestBody: true
+          encodeUrl: true
+          followRedirects: global
+          cookies:
+            send: true
+            store: true
+          rebuildPath: true
+      - url: http://localhost:3002/schedule
+        name: Get Schedule
+        meta:
+          id: req_b8f7f455eb184e1bb1d8ecb56f7e436f
+          created: 1777703389868
+          modified: 1777703397277
+          isPrivate: false
+          description: ""
+          sortKey: -1777700150338.25
+        method: GET
+        body:
+          mimeType: application/json
+          text: ""
+        headers:
+          - name: Content-Type
+            value: application/json
+          - name: User-Agent
+            value: insomnia/12.5.0
+            description: ""
+            disabled: false
+        settings:
+          renderRequestBody: true
+          encodeUrl: true
+          followRedirects: global
+          cookies:
+            send: true
+            store: true
+          rebuildPath: true
+      - url: http://localhost:3002/schedule/2
+        name: Get Schedule Depot
+        meta:
+          id: req_060703aebf6344de9b02fab20b9ce67a
+          created: 1777703460991
+          modified: 1777703516664
+          isPrivate: false
+          description: ""
+          sortKey: -1777700148095.875
+        method: GET
+        body:
+          mimeType: application/json
+          text: ""
+        headers:
+          - name: Content-Type
+            value: application/json
+          - name: User-Agent
+            value: insomnia/12.5.0
+            description: ""
+            disabled: false
+        settings:
+          renderRequestBody: true
+          encodeUrl: true
+          followRedirects: global
+          cookies:
+            send: true
+            store: true
+          rebuildPath: true
+cookieJar:
+  name: Default Jar
+  meta:
+    id: jar_387ff41a19c3532c513b05c4d2cc7d6b4204eca3
+    created: 1777698980573
+    modified: 1777698980573
+environments:
+  name: Base Environment
+  meta:
+    id: env_387ff41a19c3532c513b05c4d2cc7d6b4204eca3
+    created: 1777698980573
+    modified: 1777698980573
+    isPrivate: false
