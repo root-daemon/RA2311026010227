@@ -1,628 +1,488 @@
-# System Design Document
+# Campus Notifications Microservice — System Design & Engineering Proposal
 
-## 1. Overview
-
-This document covers two backend microservices:
-
-1. **notification_app_be** — REST API for creating and managing notifications
-2. **vehicle_maintenance_scheduler** — Optimization microservice that solves a 0/1 Knapsack problem to schedule vehicle maintenance tasks across depots within mechanic hour limits
-
-Both use a shared **logging_middleware** package that ships structured logs to an external evaluation API on every significant operation.
+This document captures an end‑to‑end design for a **Campus Notifications** platform: REST and real‑time APIs, persistence, scaling, reliability, and priority inbox semantics. It is written as implementation‑ready architecture (Stages 1–6), with assumptions, operational concerns, and security called out explicitly.
 
 ---
 
-## 2. notification_app_be Architecture
+⸻
 
-### ASCII Diagram
+## Stage 1 — API Design
 
-```
-  HTTP Client
-      │
-      ▼
-  Elysia.js (port 3001)
-      │
-      ├── cors plugin
-      │
-      ├── loggingMiddleware
-      │   ├── onRequest  → Log(info, middleware, "Incoming: METHOD /path")
-      │   ├── onAfterResponse → Log(info, middleware, "Completed: ... status")
-      │   └── onError    → Log(error, middleware, "Error on ...")
-      │
-      └── notificationRoute (/notifications)
-              │
-              ├── POST   /           → controller → service → store[]
-              ├── GET    /           → controller → service → store[]
-              ├── GET    /:id        → controller → service → store[]
-              ├── PATCH  /:id/read   → controller → service → store[]
-              └── DELETE /:id        → controller → service → store[]
-                                               │
-                                         Log() ──► External Logging API
-                                                   20.207.122.201
-```
+### System overview
 
-### Request Flow — POST /notifications
+The **Campus Notifications Microservice** is the dedicated boundary for delivering time‑sensitive, student‑scoped messages (placement drives, academic results, campus events). It sits behind an **API Gateway** (auth termination, rate limits, TLS) and coordinates with identity services, outbound channels (email/push/mobile), and a **delivery pipeline** (queue + workers) for blast sends.
 
-1. Client sends `POST /notifications` with `{ title, message, type }`
-2. CORS headers applied
-3. `loggingMiddleware.onRequest` fires → logs incoming request (fire-and-forget)
-4. TypeBox validates body; invalid input → `422` before handler runs
-5. `createNotificationHandler` called with destructured `{ body, set }`
-6. Handler logs `"Creating notification"` via `Log()` (fire-and-forget)
-7. `createNotification(body)` → generates UUID, pushes to in-memory array
-8. Handler logs `"Notification created: <id>"`, sets `status = 201`, returns object
-9. `loggingMiddleware.onAfterResponse` logs completion
+High‑level responsibilities:
 
-### Notification Data Model
+1. **Ingest**: accept notification creation for one student or many (campaigns).
+2. **Serve**: paginated reads, filters, unread counts, priority inbox (Stage 6).
+3. **Real‑time**: push new items to connected clients without aggressive polling.
 
-| Field | Type | Description |
-|-------|------|-------------|
-| `id` | `string` (UUID) | `crypto.randomUUID()` |
-| `title` | `string` | Short heading |
-| `message` | `string` | Body text |
-| `type` | `"info" \| "warn" \| "error"` | Severity |
-| `read` | `boolean` | Default `false` |
-| `createdAt` | `string` (ISO 8601) | Creation timestamp |
-
----
-
-## 3. vehicle_maintenance_scheduler Architecture
-
-### Problem Statement
-
-Given a set of maintenance tasks (each with a `Duration` in hours and an `Impact` score) and a set of depots (each with a `MechanicHours` budget), compute the optimal subset of tasks for each depot that **maximizes total Impact without exceeding MechanicHours**.
-
-This is a classic **0/1 Knapsack Problem**:
-- Weight = `Duration`
-- Value = `Impact`
-- Capacity = `MechanicHours`
-
-### ASCII Diagram
+Text diagram — request path:
 
 ```
-  HTTP Client
-      │
-      ▼
-  Elysia.js (port 3002)
-      │
-      ├── cors plugin
-      │
-      ├── maintenanceCron (every minute)
-      │   └── checks in-memory vehicles, logs warn if due within 7 days
-      │
-      ├── vehicleRoute (/vehicles)
-      │   ├── POST /         → addVehicle (in-memory CRUD)
-      │   ├── GET  /         → listVehicles
-      │   └── PUT  /:id/service → recordService (reset lastServiceDate)
-      │
-      └── scheduleRoute (/schedule)
-              │
-              ├── GET /
-              │     │
-              │     ├── fetchDepots() ──► GET /evaluation-service/depots
-              │     ├── fetchVehicles() ► GET /evaluation-service/vehicles
-              │     │
-              │     └── for each depot:
-              │           knapsack(tasks, depot.MechanicHours)
-              │           → { selectedTasks, totalImpact, totalDuration }
-              │
-              └── GET /:depotId
-                    │
-                    ├── fetchDepots() + fetchVehicles() (parallel)
-                    ├── find depot by ID
-                    └── knapsack(tasks, depot.MechanicHours)
+Client → API Gateway (HTTPS, JWT) → Notification Service → PostgreSQL / Redis / Queue
+                                                      ↘ SSE/WebSocket Adapter
+                                                      ↘ Workers → Email / Push / Mobile
 ```
 
-### Optimization Flow
+### REST API endpoints
 
-```
-fetchDepots()  ──┐
-                 ├── Promise.all → [depots, tasks]
-fetchVehicles() ─┘
-                        │
-              for each depot:
-                        │
-              ┌─────────▼──────────────────────────────────────┐
-              │  0/1 Knapsack DP                                │
-              │                                                  │
-              │  dp[i][w] = max impact using first i tasks      │
-              │             within capacity w                    │
-              │                                                  │
-              │  Fill table: O(n * W)                           │
-              │  Traceback:  O(n)                               │
-              │  Total:      O(n * W) time, O(n * W) space      │
-              └─────────────────────────────────────────────────┘
-                        │
-              { selectedTasks, totalImpact, totalDuration }
-```
+Base path: `/notifications` (versioned externally as `/v1/notifications` if required by the gateway).
 
-### Schedule Response Schema
+| Method | Path | Purpose |
+|--------|------|--------|
+| `GET` | `/notifications` | List notifications for the authenticated student with optional filters and pagination. |
+| `GET` | `/notifications/:id` | Fetch a single notification by id (ownership enforced). |
+| `POST` | `/notifications` | **Admin/internal**: create notification for student(s)*; returns created resource or job id for bulk. |
+| `PATCH` | `/notifications/:id/read` | Mark one notification read (idempotent). |
+| `POST` | `/notifications/read-batch` | Mark many ids read in one transaction. |
+| `GET` | `/notifications/unread-count` | O(1) or cached count of unread items. |
+| `POST` | `/internal/notify` | **Trusted**: enqueue “notify users” campaign (targets + payload); returns `notification_batch_id`. |
+| `GET` | `/notifications/priority` | Top‑N scored inbox (Stage 6). |
+
+*Production pattern: `/internal/notify` for mass sends; `POST /notifications` for single‑recipient or low‑volume admin tools.*
+
+**Filter/query parameters on `GET /notifications`:**
+
+| Parameter | Example | Description |
+|-----------|---------|-------------|
+| `read` | `true` \| `false` | Filter by read state (join to `notification_reads`). |
+| `type` | `Placement` \| `Result` \| `Event` | Filter by notification category. |
+| `since` | ISO 8601 | Only notifications at or after timestamp. |
+| `cursor` | opaque | Cursor‑based pagination (Stage 4). |
+| `limit` | default 20, max 100 | Page size. |
+
+### Request / response schemas (illustrative JSON)
+
+**`POST /notifications` (single create)**
+
+```http
+POST /notifications HTTP/1.1
+Content-Type: application/json
+Authorization: Bearer <jwt>
+Idempotency-Key: <optional-uuid>
+```
 
 ```json
 {
-  "depotId": 2,
-  "mechanicHours": 135,
-  "totalImpact": 187,
-  "totalDuration": 134,
-  "selectedTasks": [
-    { "TaskID": "uuid", "Duration": 4, "Impact": 7 }
-  ]
+  "studentId": 1042,
+  "title": "On‑campus: CSX briefing",
+  "message": "CSX Corporation — briefing at Hall A, 4pm.",
+  "type": "Placement",
+  "metadata": { "source": "cdc_portal", "campaignId": "cmp_01" }
 }
 ```
 
-### Complexity Analysis
-
-| Metric | Value |
-|--------|-------|
-| Algorithm | 0/1 Knapsack (Bottom-up DP) |
-| Time complexity | O(n × W) per depot |
-| Space complexity | O(n × W) |
-| n (tasks) | ~30–40 (from live API) |
-| W (max hours) | ~200 |
-| Operations per depot | ~8,000 |
-| Suitable for | Real-world scale — handles thousands of tasks efficiently |
-
-Brute-force would be O(2^n) — infeasible at n=40 (2^40 ≈ 1 trillion operations). DP reduces this to O(n×W) which is sub-10K operations for this dataset.
-
----
-
-## 4. Logging Strategy
-
-All services use `Log(stack, level, packageName, message)` from `@local/logging-middleware`.
-
-| Layer | Package | Level | Event |
-|-------|---------|-------|-------|
-| Middleware | `middleware` | `info` | Every incoming request |
-| Middleware | `middleware` | `info` | Every completed response |
-| Middleware | `middleware` | `error` | Unhandled errors |
-| Controller | `controller` | `info` | Handler invoked |
-| Controller | `controller` | `warn` | Resource not found |
-| Service | `service` | `info` | Optimization start/complete |
-| Service | `service` | `warn` | Depot not found |
-| Handler | `handler` | `info` | External API fetch start/complete |
-| Handler | `handler` | `error` | External API failure |
-| Route | `route` | `info` | Route hit |
-| Cron | `cron_job` | `info` | Sweep complete |
-| Cron | `cron_job` | `warn` | Vehicle due for maintenance |
-
-All `Log()` calls are fire-and-forget (`void Log(...)`) — logging failures never block request processing.
-
----
-
-## 5. Error Handling
-
-| Scenario | Behavior |
-|----------|----------|
-| Invalid request body | TypeBox returns `422` automatically before handler runs |
-| Resource not found | Handler sets `set.status = 404`, returns `{ error: "..." }` |
-| External API auth failure | `fetchDepots/fetchVehicles` throws, caught at route, returns `500` |
-| Depot ID not in current set | Returns `404` with `{ error: "...", availableDepots: [...] }` |
-| `Log()` network failure | Swallowed silently — app continues normally |
-
----
-
-## 6. API Interaction Notes
-
-The evaluation API returns **dynamic data** — depot IDs and task lists change on every call. Implications:
-
-- `GET /schedule` always works — fetches fresh data and processes all current depots
-- `GET /schedule/:depotId` — if the ID isn't in the current response, returns a `404` with the currently available depot IDs in `availableDepots[]`
-- Both depots and vehicles are fetched in a single `Promise.all` per request to minimize API round-trips and keep data consistent within one optimization run
-
----
-
-## 7. Retry and Resilience
-
-**Current (evaluation scope):**
-- No retry on external API failures — a single failure returns `500`
-- No data persistence — in-memory store resets on restart
-- `Log()` swallows failures silently
-
-**Production upgrade path:**
-- Exponential backoff + retry on external API calls (e.g. 3 retries with jitter)
-- Redis cache for depot/vehicle data (TTL: 30s) to reduce API pressure
-- Persistent DB for notification store
-- Dead-letter queue for failed log entries
-
----
-
-## 8. Scalability Notes
-
-**In-memory store limitations:**
-- State is per-process — horizontal scaling requires a shared store (Redis, Postgres)
-- Vehicle/notification data is lost on restart
-
-**Knapsack at scale:**
-- O(n × W) scales well: 1000 tasks × 10000 hours = 10M ops — still milliseconds
-- For larger datasets, consider fractional relaxation or greedy approximation as a pre-filter
-
-**Cron at scale:**
-- One cron fires per process — use a distributed lock (Redis `SETNX`) to prevent duplicate sweeps across replicas
-
-**CORS:**
-- Currently `*` (open) — restrict to known origins in production
-
----
-# Stage 1
-
-## REST API Design
-
-### Naming Conventions
-- Base path: `/notifications`
-- Kebab-case paths, plural resource nouns
-- Query params for filtering, path params for resource identity
-
-### Endpoints
-
-| Method | Path | Description |
-|--------|------|-------------|
-| `POST` | `/notifications` | Create a new notification |
-| `GET` | `/notifications` | List notifications (filterable) |
-| `GET` | `/notifications/:id` | Get single notification |
-| `PATCH` | `/notifications/:id/read` | Mark notification as read |
-| `DELETE` | `/notifications/:id` | Delete a notification |
-| `GET` | `/notifications/unread-count` | Count of unread notifications |
-| `GET` | `/notifications/priority` | Top N priority notifications |
-
-### Headers (all requests)
-```
-Authorization: Bearer <token>
-Content-Type: application/json
-Accept: application/json
-```
-
-### Request / Response Schemas
-
-**POST /notifications**
 ```json
-Request:
-{ "title": "string (required)", "message": "string (required)", "type": "Placement|Result|Event (required)" }
-
-Response 201:
-{ "id": "uuid", "title": "...", "message": "...", "type": "Placement", "read": false, "createdAt": "2026-04-22T17:51:18.000Z" }
-
-Response 422:
-{ "type": "validation", "on": "body", "summary": "...", "errors": [...] }
+{
+  "id": "8b2c…",
+  "studentId": 1042,
+  "title": "On‑campus: CSX briefing",
+  "message": "CSX Corporation — briefing at Hall A, 4pm.",
+  "type": "Placement",
+  "read": false,
+  "createdAt": "2026-05-02T10:15:30.000Z"
+}
 ```
 
-**GET /notifications**
-```
-Query params:
-  ?read=true|false        (optional — filter by read status)
-  ?type=Placement|Result|Event  (optional — filter by type)
-  ?page=1&limit=20        (optional — pagination)
+**`GET /notifications?read=false&type=Placement&limit=20`**
 
-Response 200:
-{ "notifications": [ { "id": "...", "title": "...", "message": "...", "type": "...", "read": false, "createdAt": "..." } ], "total": 42 }
-```
-
-**GET /notifications/unread-count**
 ```json
-Response 200:
+{
+  "notifications": [
+    {
+      "id": "8b2c…",
+      "title": "…",
+      "message": "…",
+      "type": "Placement",
+      "read": false,
+      "createdAt": "2026-05-02T10:15:30.000Z"
+    }
+  ],
+  "nextCursor": "eyJjcmVhdGVkQXQiOiIuLiJ9",
+  "hasMore": true
+}
+```
+
+**`PATCH /notifications/:id/read`**
+
+Response `200`:
+
+```json
+{
+  "id": "8b2c…",
+  "read": true,
+  "readAt": "2026-05-02T11:00:01.123Z"
+}
+```
+
+**`GET /notifications/unread-count`**
+
+```json
 { "count": 7 }
 ```
 
-**PATCH /notifications/:id/read**
+**`POST /internal/notify`** (trusted service‑to‑service)
+
 ```json
-Response 200:
-{ "id": "...", "title": "...", "message": "...", "type": "...", "read": true, "createdAt": "..." }
-
-Response 404:
-{ "error": "Notification not found" }
+{
+  "studentIds": [1042, 1043, …],
+  "title": "Fee payment deadline",
+  "message": "…",
+  "type": "Event",
+  "channels": ["in_app", "email"]
+}
 ```
 
-**GET /notifications/priority**
-```
-Query params:
-  ?n=10   (optional — top N, default 10, max 100)
-
-Response 200:
-{ "notifications": [ { "ID": "uuid", "Type": "Placement", "Message": "CSX Corporation hiring", "Timestamp": "2026-04-22 17:51:18" } ] }
-```
-
-### Real-Time Notification Design
-
-When dealing with notifications that come in real-time, the preferred option is SSE over pure WebSockets because notifications only come one direction: from server to client. SSE is backed by HTTP, offers automatic re-connection and runs transparently behind proxies without additional configuration.
-
-**SSE Endpoint:**
-```
-GET /notifications/stream
-Headers: Authorization: Bearer <token>
-         Accept: text/event-stream
+```json
+{
+  "batchId": "nbatch_…",
+  "accepted": 9821,
+  "status": "queued"
+}
 ```
 
-**SSE Event Format:**
-```
-event: notification
-data: {"ID":"uuid","Type":"Placement","Message":"CSX Corporation hiring","Timestamp":"2026-04-22T17:51:18Z"}
+### Headers
 
-event: ping
-data: {"ts":1745344278}
-```
+| Header | When required | Meaning |
+|--------|----------------|--------|
+| `Authorization: Bearer <JWT>` | Authenticated reads/writes | Student or service identity claims (`sub`, `student_id`, `roles`). |
+| `Content-Type: application/json` | Bodies present | Serialization. |
+| `Accept: application/json` | Preferred | Negotiation (`application/json` or `text/event-stream` for stream). |
+| `Idempotency-Key` | Safe retries | Deduplicates `POST` duplicate submissions (paired with TTL store). |
 
-**Flow:**
+### Authentication flow
+
+1. Client obtains JWT from campus IdP / OAuth device flow.
+2. **API Gateway** validates signature, expiry, issuer, audience; injects forwarded identity headers if needed internally.
+3. **Notification Service** resolves `student_id` from JWT `sub`/claim; denies cross‑tenant access (cannot read another student’s `:id`).
+4. **Internal** routes (`/internal/*`) use **mTLS + service JWT** or **signed gateway headers**, not browser tokens.
+
+Diagram:
+
 ```
-Client                          Server
-  │                               │
-  ├── GET /notifications/stream ──►│
-  │   Accept: text/event-stream   │
-  │◄── 200 Content-Type: text/    │
-  │       event-stream ───────────│
-  │                               │
-  │◄── event: notification ───────│  (new notification arrives)
-  │    data: { ... }              │
-  │                               │
-  │◄── event: ping ───────────────│  (keepalive every 30s)
-  │    data: { ts: ... }          │
-  │                               │
-  │    [connection dropped]       │
-  ├── reconnect with Last-Event-ID►│  (browser auto-reconnects)
+[Client] → login → [IdP] → access_token (JWT)
+[Client] → GET /notifications (Authorization: Bearer …)
+           → [Gateway verifies JWT]
+           → [Notification Service] scopes queries to student_id from claims
 ```
 
-**WebSocket alternative** (for bidirectional use, e.g. marking as read in real time):
+### Real‑time notification mechanism
+
+**Mechanism**: **Server‑Sent Events (SSE)** on `GET /notifications/stream` for default campus web clients.
+
+- **SSE** uses one long‑lived HTTP response (`Content-Type: text/event-stream`), automatic browser reconnect, standard HTTP infra (proxies/ALBs), server→client direction only — ideal for notification fan‑out.
+- **WebSocket** (`wss://…/notifications/ws`) suits mobile or bidirectional needs (heartbeat, ACK, collaborative features).
+
+### WebSocket vs SSE — comparison and choice
+
+| Aspect | SSE | WebSocket |
+|--------|-----|-----------|
+| Direction | Primarily server → client | Bidirectional |
+| Transport | HTTP/1.1 or HTTP/2 | Dedicated upgrade |
+| Reconnect | Built‑in (`Last-Event-ID`) | App must implement |
+| Proxies/CDN | Straightforward HTTP | Occasionally trickier ops |
+| Binary payload | Limited | Efficient |
+
+**Choice for campus web inbox:** **SSE** as the primary channel: notifications are overwhelmingly **push‑only**, operational complexity stays low, horizontal scale is handled by subscribing each app instance to a **Redis Pub/Sub** or **broker** topic keyed by student.
+
+Text flow:
+
 ```
-ws://host/notifications/ws
-Client → { "action": "mark_read", "id": "uuid" }
-Server → { "event": "notification", "data": { ... } }
+PostgreSQL INSERT → Publisher → Redis channel notif:{studentId}
+       → SSE process subscribed → flush `event: notification` to client's stream
 ```
+
+If native apps later require ACK or typing indicators, expose **WebSocket** alongside SSE.
 
 ---
 
-# Stage 2
+⸻
 
-## Database Design
+## Stage 2 — Database Design
 
-### Choice: PostgreSQL
+### Chosen DB: PostgreSQL
 
-We picked PostgreSQL because it offers ACID compliance and because we needed a system that guaranteed exact once notification delivery. PostgreSQL's JSONB column makes it trivial to store varied notification metadata without any need for schema migrations, and it has an ENUM type built into the database for notification categories. Row-level locks enable concurrency read updates to be performed safely, and its large ecosystem support for connection pooling and read replicas are invaluable. PostgreSQL also offers a native LISTEN/NOTIFY, which allows for lightweight internal pub/sub without Redis.
+**PostgreSQL** is the relational store because:
 
-We ruled out NoSQL alternatives like MongoDB and DynamoDB because they are not capable of providing ACID for multiple writes in a single transaction (necessary for bulk inserting records while maintaining audit trail) and they do not support eventual consistency as safely; an event arriving late to an already delivered notification could easily cause a duplicate display. They are also significantly more limited in terms of flexible query power for combine searches with pagination.
+- **ACID transactions** unify “record exists + enqueue event” semantics for reliable delivery initiation.
+- **Strong constraints** (`FOREIGN KEY`, check constraints, enums) preserve data hygiene at scale.
+- **JSONB** allows optional structured `metadata` without schema churn.
+- **Mature tooling**: partitioning declarative DDL, streaming **read replicas**, **LISTEN/NOTIFY** for low‑latency internal signals (still pair with Kafka/SQS for cross‑AZ durability in production).
 
-### Schema
+NoSQL alternatives are viable at extreme fan‑out archival tiers but add complexity for transactional read/unread correctness and analytical joins; Postgres remains the pragmatic default here.
+
+### Schema design
+
+**Design principle:** Notifications are treated as **immutable content** once written (corrections = new notification). **Read state** lives in **`notification_reads`** to avoid rewriting hot rows on every open.
 
 ```sql
 CREATE TYPE notification_type AS ENUM ('Placement', 'Result', 'Event');
 
 CREATE TABLE students (
-  student_id   BIGINT PRIMARY KEY GENERATED ALWAYS AS IDENTITY,
-  name         TEXT        NOT NULL,
-  email        TEXT UNIQUE NOT NULL,
-  created_at   TIMESTAMPTZ NOT NULL DEFAULT now()
+  student_id BIGINT PRIMARY KEY GENERATED ALWAYS AS IDENTITY,
+  name       TEXT NOT NULL,
+  email      TEXT UNIQUE NOT NULL,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
 CREATE TABLE notifications (
-  id           UUID         PRIMARY KEY DEFAULT gen_random_uuid(),
-  student_id   BIGINT       NOT NULL REFERENCES students(student_id) ON DELETE CASCADE,
-  type         notification_type NOT NULL,
-  title        TEXT         NOT NULL,
-  message      TEXT         NOT NULL,
-  is_read      BOOLEAN      NOT NULL DEFAULT false,
-  created_at   TIMESTAMPTZ  NOT NULL DEFAULT now()
+  id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  student_id  BIGINT NOT NULL REFERENCES students(student_id) ON DELETE CASCADE,
+  type        notification_type NOT NULL,
+  title       TEXT NOT NULL,
+  message     TEXT NOT NULL,
+  metadata    JSONB NOT NULL DEFAULT '{}',
+  created_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
+  CONSTRAINT title_nonempty CHECK (char_length(title) > 0),
+  CONSTRAINT message_nonempty CHECK (char_length(message) > 0)
+);
+
+CREATE TABLE notification_reads (
+  student_id      BIGINT NOT NULL REFERENCES students(student_id) ON DELETE CASCADE,
+  notification_id UUID NOT NULL REFERENCES notifications(id) ON DELETE CASCADE,
+  read_at        TIMESTAMPTZ NOT NULL DEFAULT now(),
+  PRIMARY KEY (student_id, notification_id)
 );
 ```
+
+### Relationships
+
+- `students (1) — (N) notifications` — each notification row belongs to one student.
+- `notifications` (1) — (0..1) `notification_reads` per `(student_id, notification_id)` — absence of row ⇒ unread.
+
+Unread query pattern:
+
+```sql
+SELECT n.*
+FROM notifications n
+LEFT JOIN notification_reads nr
+  ON nr.notification_id = n.id AND nr.student_id = n.student_id
+WHERE n.student_id = $student
+  AND nr.notification_id IS NULL;
+```
+
+*(Alternatively store `notifications.student_id` as redundant join key consistently; PK on reads already ties student + notification.)*
 
 ### Indexes
 
 ```sql
--- Primary query pattern: unread notifications for a student, newest first
-CREATE INDEX idx_notifications_student_unread_time
-  ON notifications (student_id, is_read, created_at DESC);
+-- Feed: student’s inbox newest first (covers read filter via semi-join planner)
+CREATE INDEX idx_notifications_student_created
+  ON notifications (student_id, created_at DESC);
 
--- Filter by type (Stage 3 placement query, analytics)
-CREATE INDEX idx_notifications_type_time
+-- Type + recency analytics / Stage 3 placement slice
+CREATE INDEX idx_notifications_type_created
   ON notifications (type, created_at DESC);
+
+-- Mark-read lookups and FK support
+CREATE INDEX idx_reads_notification ON notification_reads (notification_id);
 ```
 
-### SQL Queries for Stage 1 APIs
+Consider **partial index** if “unread only” dominates:
 
 ```sql
--- GET /notifications?read=false (student 1042)
-SELECT id, type, title, message, is_read, created_at
-FROM notifications
-WHERE student_id = 1042 AND is_read = false
-ORDER BY created_at DESC
-LIMIT 20 OFFSET 0;
+-- Optional helper: maintain only unread pointer table in some designs — here we keep reads sparse.
+```
 
--- PATCH /notifications/:id/read
-UPDATE notifications
-SET is_read = true
-WHERE id = $1 AND student_id = $2
+For **high read volume**, a **materialized unread count per student** (denormalized) can be maintained by trigger or nightly reconcile (tradeoff vs write amplification).
+
+### Scaling issues & mitigations
+
+| Pressure | Risk | Mitigation |
+|----------|------|-------------|
+| Table growth | Long sequential scans | **Range partitioning** on `notifications.created_at` |
+| Hot rows on dominant `student_id` | Uneven shard keys | Shard by hashed `student_id` if multi‑tenant cluster |
+| Read storms | Replica lag | Cache hot lists Redis; prioritize **SSE push** vs pull |
+| Write spikes | WAL/insert path | Bulk `COPY`; async fan‑out queue |
+| Heavy `COUNT(*)` | Expensive aggregates | Maintain **counter row** per student |
+
+### Partitioning
+
+Monthly (or weekly) declarative partitions on `notifications`; **prune old partitions** to cold storage. Primary key and indexes must align with partition key strategy (common choice: PK `(created_at, id)` or composite aligning with partitioning — requires careful migration in real deployments).
+
+### Read replicas & caching ideas
+
+- **Streaming replication replica** serves `GET /notifications`, `priority`, dashboards; writes go to primary only.
+- **Redis**: cache assembled first page `{student}:feed:v1`; invalidate on insert or mark‑read pattern (Stage 4).
+- **Stale reads**: Replica lag is tolerated for inbox (seconds); mark‑read and **unread_count** ideally read **recent primary** or use counter table.
+
+### SQL queries backing Stage 1 APIs
+
+```sql
+-- GET /notifications?read=false&limit=21 (cursor optional)
+SELECT n.id, n.type, n.title, n.message, n.metadata, n.created_at,
+       (nr.notification_id IS NOT NULL) AS read
+FROM notifications n
+LEFT JOIN notification_reads nr
+  ON nr.notification_id = n.id AND nr.student_id = n.student_id
+WHERE n.student_id = $student
+  AND ($read_filter IS NULL OR ($read_filter = true AND nr.notification_id IS NOT NULL)
+                             OR ($read_filter = false AND nr.notification_id IS NULL))
+ORDER BY n.created_at DESC
+LIMIT $limit;
+
+-- PATCH /notifications/:id/read — idempotent
+INSERT INTO notification_reads (student_id, notification_id)
+VALUES ($student, $id)
+ON CONFLICT (student_id, notification_id) DO NOTHING;
+
+-- GET unread count
+SELECT COUNT(*) AS count
+FROM notifications n
+LEFT JOIN notification_reads nr
+  ON nr.notification_id = n.id AND nr.student_id = n.student_id
+WHERE n.student_id = $student AND nr.notification_id IS NULL;
+
+-- POST /notifications (single row + optional enqueue side effect in app layer)
+INSERT INTO notifications (student_id, type, title, message, metadata)
+VALUES ($student, $type::notification_type, $title, $message, $metadata::jsonb)
 RETURNING *;
 
--- GET /notifications/unread-count
-SELECT COUNT(*) AS count
-FROM notifications
-WHERE student_id = $1 AND is_read = false;
-
--- POST /notifications (mass insert — see Stage 5)
+-- POST /internal/notify — transactional bulk rows + publish (app commits then enqueues)
 INSERT INTO notifications (student_id, type, title, message)
-VALUES ($1, $2, $3, $4)
-RETURNING id, created_at;
+SELECT unnest($student_ids), $type::notification_type, $title, $message;
 ```
-
-### Scaling Issues and Solutions
-
-| Problem | Solution |
-|---------|----------|
-| Table grows to billions of rows | Range-partition by `created_at` (monthly partitions) — old partitions archived or dropped |
-| Hot student IDs on single shard | Shard by `student_id % N` across N Postgres instances |
-| Read-heavy dashboard queries | Read replicas with streaming replication; route GET traffic to replicas |
-| Write bottleneck for mass notify | Batch `INSERT` with `COPY` command; queue-driven async writes |
-| `COUNT(*)` is slow on large tables | Maintain a `notification_counts` summary table, increment via trigger |
-
-### Partitioning Strategy
-
-```sql
-CREATE TABLE notifications (
-  id          UUID,
-  student_id  BIGINT,
-  type        notification_type,
-  message     TEXT,
-  is_read     BOOLEAN DEFAULT false,
-  created_at  TIMESTAMPTZ NOT NULL
-) PARTITION BY RANGE (created_at);
-
-CREATE TABLE notifications_2026_04 PARTITION OF notifications
-  FOR VALUES FROM ('2026-04-01') TO ('2026-05-01');
-
-CREATE TABLE notifications_2026_05 PARTITION OF notifications
-  FOR VALUES FROM ('2026-05-01') TO ('2026-06-01');
-```
-
-Queries automatically prune irrelevant partitions. Old partitions can be detached and archived to cold storage.
 
 ---
 
-# Stage 3
+⸻
 
-## Query Optimization
+## Stage 3 — Query Optimization
 
-### Given Query
+### Why the naive query is slow
 
-```sql
-SELECT * FROM notifications
-WHERE studentID = 1042 AND isRead = false
-ORDER BY createdAt DESC;
-```
-
-### Is It Accurate?
-
-Functionally correct — returns unread notifications for student 1042 in reverse-chronological order. However it has correctness problems in production:
-- `SELECT *` returns all columns including large `message` text blobs, wasting bandwidth
-- No `LIMIT` — returns unbounded rows (a student with 10,000 notifications returns all of them)
-
-### Why Is It Slow?
-
-Without an index, when performing a notification search with just a WHERE student_id = X clause, PostgreSQL scans the entire notifications table (all ten million rows from disk), filters for the matching student ID, filters for the unread status, sorts the results and presents them.
-
-### Computational Cost
-
-| Step | Cost |
-|------|------|
-| Sequential scan | O(N) — full table read |
-| Filter predicate | O(N) comparisons |
-| Sort | O(K log K) where K = matching rows |
-| **Total** | O(N) dominated by full scan |
-
-With the composite index `(studentID, isRead, createdAt DESC)`:
-- B-tree lookup by `studentID + isRead` → O(log N)
-- Index already ordered by `createdAt DESC` → sort eliminated (Index Scan Backward)
-- Only K rows fetched from heap → O(K)
-- **Total: O(log N + K)** — orders of magnitude faster
-
-### Why Indexing Every Column Is Bad
-
-Creating an index for every single column on the other hand is terrible: all writes now require writing to N indexes where N is the number of indexes. Each index takes up a full copy of the column it is indexing on disk. The vacuum process of PostgreSQL must walk through and clean out dead tuples from every index, proportional to the number of indexes it's working on. Furthermore, too many indexes lead the planner to examine far too many different query plans and therefore spend too much time planning! The rule is to only index columns in WHERE clauses, ORDER BY clauses or JOIN clauses in frequent queries in the order they appear.
-
-| Concern | Detail |
-|---------|--------|
-| **Write amplification** | Every `INSERT`/`UPDATE`/`DELETE` must update every index. 10 indexes = 10x write overhead. |
-| **Storage** | Each index is a full B-tree copy of the indexed column. 10 indexes ≈ 10× extra disk. |
-| **Vacuum overhead** | Postgres VACUUM must clean dead tuples in every index — proportional to index count. |
-| **Query planner confusion** | Too many indexes force the planner to evaluate more execution plans, slowing planning time. |
-| **Rarely used** | A column queried alone without the right selectivity won't be used anyway — wasted space. |
-
-### Query: Students with Placement Notification in Last 7 Days
+Consider:
 
 ```sql
-SELECT DISTINCT student_id
+SELECT *
 FROM notifications
-WHERE type = 'Placement'
-  AND created_at >= NOW() - INTERVAL '7 days';
+WHERE student_id = 1042
+  AND is_read = false   -- illustrative if read were a column (see normalization above)
+ORDER BY created_at DESC;
 ```
 
-With the `idx_notifications_type_time` index on `(type, created_at DESC)`, Postgres performs an index range scan — no full table read. `DISTINCT` collapses duplicates (a student may have multiple placements in 7 days).
+Without a selective index aligned to **filter + sort**, PostgreSQL tends toward **sequential scan + sort**:
 
----
+- **`SELECT *`** pulls fat columns (`message`, metadata) unnecessarily.
+- Large result sets force **expensive sorts** (`O(K log K)` rows after filter).
+- Unbounded pagination loads **millions** of stale rows nobody scrolls past.
 
-# Stage 4
+Computational dominance: **full relation scan O(N)** on `notifications`; index‑only plans reduce to **`O(log N + K)`** with proper B‑tree composite alignment.
 
-## Performance Improvements
+### Indexing strategy & composite indexes
 
-### Problem
-- Notifications fetched on every page load → DB hit on every request
-- DB overloaded with repeated identical queries
+Build composites to match **equality predicates left‑to‑right**, then **range/order**:
 
-### Solutions
+- **`(student_id, created_at DESC)`** feeds “my feed newest first”.
+- **`(type, created_at DESC)`** feeds global analytics (Stage 3 placement cohort query).
 
-#### 1. Redis Caching (Per-Student Unread List)
+Avoid duplicating unrelated low‑cardinalityLeading columns ahead of selective ones (planner chooses wrong scans).
 
-```
-GET /notifications?read=false
-  → check Redis key: notifs:unread:{studentId}
-  → HIT: return cached JSON (TTL: 30s)
-  → MISS: query Postgres → store in Redis → return
-```
+### Why indexing every column is bad
 
-On `mark_as_read` or new notification → `DEL notifs:unread:{studentId}` (cache invalidation).
+- **Write amplification**: every index must be maintained on INSERT/UPDATE/DELETE.
+- **Disk & cache pressure**: oversized index set evicts hot pages earlier.
+- **Vacuum/autoanalyze cost** scales with index cardinality.
+- **Planner time** increases (more candidate paths).
+**Rule**: index **proven critical paths** measured in production traces; add **hypothetical‑index tooling** (`pg_hypo`) load tests before shipping.
 
-**Tradeoff:** 30s stale window. Acceptable for notifications; unacceptable for payments.
-
-#### 2. Cursor-Based Pagination
-
-```
-GET /notifications?cursor=<last_created_at>&limit=20
-
-SELECT * FROM notifications
-WHERE student_id = $1 AND created_at < $cursor
-ORDER BY created_at DESC LIMIT 20;
-```
-
-Cursor-based pagination is better than offset-based because OFFSET reads and discards all previous pages from disk while cursor pagination simply skips past previous indexes. Therefore for page 500 with a limit of 20, an OFFSET pagination call will scan 10000+19 rows while the cursor-based pagination would just walk through the indexes.
-
-#### 3. SSE / WebSocket Push Instead of Polling
-
-The main drawback of clients polling a notification service every few seconds is the massive number of unnecessary read calls hitting the database: 1000 students polling every 5 seconds results in 200 calls per second mostly just returning that there are no notifications for a student. Using a persistent SSE connection is ideal as notifications are pushed when the server sees fit and are therefore never read from the database when no notification exists.
-
-#### 4. Redis Pub/Sub for SSE Fan-Out
-
-```
-New notification inserted
-  → Service publishes to Redis channel: notifs:{studentId}
-  → SSE handler subscribed to that channel
-  → Immediately pushes event to connected client
-```
-
-No polling. Sub-100ms delivery. Horizontally scalable (any SSE server instance receives the Redis message).
-
-#### 5. Denormalization: Unread Count Cache
-
-By creating a summary table and duplicating the unread count within this table we turn our potentially slow COUNT query into a fast O(1) lookup. The only tradeoff is that this requires two writes, but a regular background job to reconcile the counter helps overcome potential drift caused by an atomic failure mid-write.
+### Optimized listing query
 
 ```sql
-CREATE TABLE notification_counts (
-  student_id  BIGINT PRIMARY KEY,
-  unread      INT    NOT NULL DEFAULT 0
-);
--- Increment on INSERT, decrement on mark_as_read (via trigger or application logic)
+SELECT n.id, n.type, n.title,
+       LEFT(n.message, 280) AS preview,
+       n.created_at
+FROM notifications n
+LEFT JOIN notification_reads nr
+  ON nr.student_id = n.student_id AND nr.notification_id = n.id
+WHERE n.student_id = $1
+  AND nr.notification_id IS NULL
+ORDER BY n.created_at DESC
+LIMIT $2;
 ```
 
-#### 6. Read Replicas
+**Index:** `notifications (student_id, created_at DESC)` plus efficient join on the `notification_reads` primary key `(student_id, notification_id)`.
 
-Route all `GET` traffic to a read replica; only `POST/PATCH/DELETE` hit the primary. Postgres streaming replication lag is typically <1s — acceptable for notifications.
+### “Placement notifications” analytical query
 
-#### 7. CDN for Static Assets
+```sql
+SELECT DISTINCT n.student_id
+FROM notifications n
+WHERE n.type = 'Placement'
+  AND n.created_at >= now() - interval '7 days';
+```
 
-Static notification icons, sounds, and templates served from CDN edge (e.g., CloudFront). Reduces origin load. Not applicable to dynamic notification data.
-
-### Tradeoff Summary
-
-| Strategy | Latency Gain | Complexity | Consistency Risk |
-|----------|-------------|------------|-----------------|
-| Redis cache | High | Medium | Stale up to TTL |
-| Cursor pagination | Medium | Low | None |
-| SSE push | Very high | High | None |
-| Denormalized count | High | Medium | Counter drift |
-| Read replicas | Medium | Medium | Replication lag |
+Uses **`idx_notifications_type_created`** for range‑bounded index scan rather than sequential read of full history.
 
 ---
 
-# Stage 5
+⸻
 
-## Reliable Mass Notification Architecture
+## Stage 4 — Scaling & Performance
 
-### Given Pseudocode
+### Redis caching
+
+Cache **serialized first page + unread_total** keyed by `$student`:
 
 ```
+GET → Redis HIT → return
+MISS → Postgres + assemble → SETEX 30s
+```
+
+Invalidate on **`INSERT`** for that student and **`mark‑read`** (delete key). **Tradeoff**: brief staleness acceptable for inbox; unacceptable for ledger systems.
+
+### Pagination
+
+- **Offset** (`OFFSET 500 * 20`): database discards scanned rows ⇒ cost grows linearly with page depth.
+- **Cursor** (**recommended**): `WHERE created_at < $cursor` + `LIMIT` leverages index order.
+
+### Cursor‑based pagination (example contract)
+
+```
+GET /notifications?limit=20&cursor=opaque
+```
+
+opaque encodes `{ created_at, id }` for deterministic tie‑break under identical timestamps.
+
+### Polling vs WebSockets vs SSE baseline
+
+Polling at high QPS ⇒ **Thundering herd** hitting DB/cache. Maintain **SSE/WebSocket subscriptions** scaled by Redis Pub/Sub or broker-backed fan‑out. **Tradeoff**: connection memory / sticky routing complexity vs thundering herds.
+
+### Batching
+
+- **Produce**: batch enqueue `notify` publishes.
+- **Consume**: workers prefetch N messages respecting downstream rate limits (**token bucket**) for SMTP/APNs.
+
+
+### CDN
+
+CDN serves **avatars, attachments, static banners** bundled in rich notifications—not dynamic JSON payloads. **Tradeoff**: cache invalidation for rapidly changing creatives.
+
+### Read replicas / denormalization
+
+Replicas offload **read paths** — accept replica lag SLA. Denormalized `unread_count` row **slashes read cost** yet requires careful transactional increments—**tradeoff** consistency complexity vs lightning `GET unread-count`.
+
+**Summary tradeoffs:**
+
+| Technique | Wins | Pays |
+|-----------|------|------|
+| Redis cache | latency, DB shielding | staleness TTL |
+| Cursor pagination | predictable latency | UX for random page jumps harder |
+| Push channels | minimizes idle reads | infra & connection cost |
+| Denorm counters | ultra-fast counts | invariant bugs if unsync'd |
+| Replicas | read scale | staleness semantics |
+
+---
+
+⸻
+
+## Stage 5 — Reliable Notification Architecture
+
+### Flaws in a naive synchronous implementation
+
+```text
 function notify_all(student_ids, message):
     for student_id in student_ids:
         send_email(student_id, message)
@@ -630,212 +490,198 @@ function notify_all(student_ids, message):
         push_to_app(student_id, message)
 ```
 
-### Shortcomings
+Problems: **serialized latency explosion**, single failure kills tail progress, partial success **ambiguous**, **duplicate side effects on retry**, no **rate limiting/backpressure**, no **delivery audit trail**.
 
-The original pseudocode has multiple flaws: all operations occur synchronously in a sequential loop, meaning 10,000 students multiplied by three operations = 30,000 disk IO calls in serial at 50ms per IO will take over 25 minutes and keep the calling thread locked. Any one error causes the whole function to fail and prevent any notification from being sent to any subsequent student. Idempotency is missing so retrying this will create duplicate notifications and database entries. No retry logic means failed attempts are never recovered. Also email, DB write, push notification are all performed in one execution context so a slow email server blocks all other operations completely.
+### Queue‑based architecture
 
-| Problem | Detail |
-|---------|--------|
-| **Synchronous serial loop** | 10,000 students × 3 operations = 30,000 sequential I/O calls. At 50ms each → 25 minutes. The caller blocks the entire time. |
-| **No failure handling** | If `send_email` throws on student #201, the entire function crashes. Students 202–10,000 receive nothing. |
-| **No idempotency** | On retry, `save_to_db` inserts duplicates. Students get duplicate DB records and duplicate push notifications. |
-| **No retry logic** | Transient SMTP or push network errors cause permanent failure with no recovery. |
-| **No partial-failure recovery** | No way to know which students succeeded vs failed after a crash midway. |
-| **Tight coupling** | Email, DB, and push are in the same transaction boundary. A slow email provider blocks DB writes. |
-| **No backpressure** | All 10,000 emails dispatched simultaneously — could exhaust SMTP connection pool or get rate-limited. |
+Insert canonical rows (**source of truth**), publish **immutable events** referencing `notification_id` and routing key `student_id` to Kafka, SQS, or RabbitMQ. **Workers** horizontally scale outbound I/O.
 
-### The Partial Failure Problem: 200 Emails Failed Midway
-
-`send_email` failed starting at student #201. We now have:
-- Students 1–200: email sent ✓, saved to DB ✓, push sent ✓
-- Students 201–10,000: nothing done
-
-**Without idempotency:** Retrying from scratch re-sends to students 1–200 (duplicate emails).
-**Solution:** An idempotency key per `(studentId, notificationId)` pair:
-- Before sending, check if `notification_sends(student_id, notification_id, channel)` already has `status = 'sent'`
-- If yes: skip. If no (or `status = 'failed'`): send and update status.
-
-This makes the entire operation safe to retry from any point.
-
-### Redesigned Architecture
-
-The refactored architecture addresses all these issues by first bulk-inserting all queued notifications into the database and then queuing each individual message on a message queue that the worker threads will read from. Returning quickly to the caller ensures responsiveness of the original request. Async workers will process notifications on the queue in parallel with an idempotency check being performed before any other action is taken. When a message is encountered that fails it is re-queued with exponential backoff. After N retries the notification is added to a Dead Letter Queue where it will be handled by human operators or re-sent.
+Architecture sketch:
 
 ```
-notify_all(student_ids, message)
-    │
-    ▼
-Generate notification_id (UUID)
-    │
-    ▼
-Bulk insert into notifications table (student_id, notification_id, status='pending')
-    │
-    ▼
-Publish events to Message Queue (one message per student)
-    │
-    [Returns immediately — caller not blocked]
-    │
-    ▼  (async workers)
-┌─────────────────────────────────────────────────────────┐
-│  Worker Pool (N consumers from queue)                   │
-│                                                          │
-│  For each message:                                       │
-│    1. Idempotency check: skip if already 'sent'         │
-│    2. send_email()   → on failure: NACK → retry queue   │
-│    3. push_to_app()  → on failure: NACK → retry queue   │
-│    4. UPDATE status = 'sent' in DB                      │
-│                                                          │
-│  Max retries exceeded → Dead Letter Queue (DLQ)         │
-└─────────────────────────────────────────────────────────┘
-    │
-    ▼
-DLQ consumer:
-  - Alert ops team
-  - Store failed student_ids for manual review / re-send
+┌──────────────────┐     bulk insert       ┌─────────────┐
+│ Admin / Campaign │ ─────────────────────► │ PostgreSQL  │
+└────────┬─────────┘                         └──────▲──────┘
+         │ enqueue                                │ status
+         ▼                                          │
+┌──────────────────┐   consume/work         ┌───────┴───────┐
+│ Message Queue    │ ─────────────────────► │ Worker Pool │
+└────────┬─────────┘                         └───┬───┬─────┘
+         │ retries / DLQ                          │   │
+         ▼                                           │   │
+┌──────────────────┐                                   │   └─► Push / SSE bridge
+│ Dead-letter Q    ◄─────────────────── failures Nx   │
+└──────────────────┘                                   └────► SMTP / SES
 ```
 
-**Key components:**
-- **Message Queue** (RabbitMQ / SQS / Kafka): decouples producer from consumers, enables backpressure
-- **Idempotency table** `notification_sends(student_id, notification_id, channel, status, attempts)`: prevents duplicates on retry
-- **Dead Letter Queue**: captures permanently failed deliveries for manual intervention
-- **Batch DB inserts**: bulk insert all `pending` records before queueing — DB is source of truth even before delivery
-- **Exponential backoff**: retry delay = `min(2^attempt × 100ms + jitter, 30s)`
+### Retries & dead‑letter queues (DLQ)
 
-### Revised Pseudocode
+- **Transient** errors (SMTP 4xx timeouts, downstream 503): exponential backoff **`2^n * base + jitter`**, capped; requeue limited attempts.
+- **Permanent** failures (invalid email): **immediate DLQ** with diagnostic payload **without endless retry noise**.
 
-```python
-function notify_all(student_ids, message):
-    notification_id = generate_uuid()
-    
-    # Bulk write all pending records atomically
-    bulk_insert_notification_sends(
-        [{ student_id, notification_id, status: "pending" } for student_id in student_ids]
-    )
-    
-    # Enqueue one message per student (non-blocking)
-    for student_id in student_ids:
-        enqueue("notification_jobs", {
-            student_id: student_id,
-            notification_id: notification_id,
-            message: message
+### Async workers & event‑driven design
+
+Orchestration is **event‑driven**: campaign accepted → partitioned topics by `shard(student_id)` for ordered per‑student processing.**Competing consumers** improve throughput.**Idempotent consumers** reconcile with DB state.
+
+
+### Idempotency
+
+Declare a unique constraint on `(delivery_id, channel, recipient)` surface, or support HTTP **`Idempotency-Key`** for producers. Carry a stable **`notification_batch_id`** and student identifier through queue messages so replays remain safe.
+
+### Revised pseudocode
+
+```pseudo
+FUNCTION notify_campaign(student_ids[], payload):
+    batch_id = uuid()
+    TX BEGIN
+        INSERT notification_batches (...) VALUES (batch_id, ...)
+        INSERT INTO notifications (student_id, title, message, type, batch_id)
+          SELECT unnest(student_ids), payload.title, payload.message, payload.type, batch_id
+    TX COMMIT
+
+    PARALLEL FOR EACH student_id IN student_ids:
+        enqueue("deliver.notification", {
+            batch_id,
+            student_id,
+            dedupe_key: hash(batch_id, student_id)
         })
-    
-    return { notification_id, queued: len(student_ids) }
+
+    RETURN { batch_id, queued: len(student_ids) }
 
 
-# Async worker (runs N instances in parallel)
-function process_notification_job(job):
-    { student_id, notification_id, message } = job
-    
-    # Idempotency guard
-    record = get_send_record(student_id, notification_id)
-    if record.status == "sent":
-        ack(job)
-        return
-    
-    try:
-        send_email(student_id, message)
-        push_to_app(student_id, message)
-        update_status(student_id, notification_id, "sent")
-        ack(job)
-    except TransientError as e:
-        if record.attempts < MAX_RETRIES:
-            nack(job, delay=backoff(record.attempts))  # requeue with delay
-        else:
-            move_to_dlq(job, reason=str(e))
-            update_status(student_id, notification_id, "failed")
-            ack(job)
+WORKER on message m:
+    IF delivery_record_exists(m.dedupe_key):
+        ACK; RETURN
 
-
-# DLQ consumer
-function process_dlq(job):
-    alert_ops(job)
-    log_permanent_failure(job)
-    # Optionally: store in failed_notifications table for admin retry UI
+    TRY:
+        IF "email" IN channels: send_email(m)
+        IF "push" IN channels: send_push(m)
+        IF "sse" IN channels: publish_realtime_fanout(m.student_id)
+        mark_delivered(m.dedupe_key)
+        ACK
+    CATCH transient_error AS e:
+        IF attempts++ < MAX: NACK(delay=backoff(attempts))
+        ELSE: publish(DLQ, m + error_context); ACK
 ```
 
 ---
 
-# Stage 6
+⸻
 
-## Priority Inbox Implementation
+## Stage 6 — Priority Inbox
 
-### Endpoint
+Goal: **`GET /notifications/priority?n=10`** returns the **best** N items blending **semantic importance** and **recency** without sorting all historic rows whenever possible.
 
-```
-GET /notifications/priority?n=10
-Authorization: Bearer <token>
-```
 
-### Scoring Formula
+### Scoring logic
 
-The scoring formula weights notifications by type and applies negative weighting by age, so a notification is scored based on both importance and timeliness. A fresh notification with high importance will score highly over a stale one with high importance and a notification with extreme importance even over a fresh one with low importance due to recency weighting!
+Example multiplicative/decay model:
 
 ```
-priority_score = type_weight × 1000 / (1 + age_in_hours)
+priority_score(type_weight, age_hours) = type_weight * 1000 / (1 + age_hours)
 ```
 
-| Type | Weight |
-|------|--------|
+| Type | `type_weight` |
+|------|----------------|
 | Placement | 3 |
 | Result | 2 |
 | Event | 1 |
 
-### Implementation
+**Recency weighting**: the divisor `(1 + age_hours)` dampens stale items nonlinearly—young Placement still outranks old Placement unless age dominates.
 
-**`services/notification.service.ts`** — scoring + sorting:
-```typescript
-const TYPE_WEIGHTS: Record<string, number> = { Placement: 3, Result: 2, Event: 1 };
+### Priority calculation variants
 
-function priorityScore(n: EvalNotification): number {
-  const ageHours = (Date.now() - new Date(n.Timestamp).getTime()) / 3_600_000;
-  return (TYPE_WEIGHTS[n.Type] ?? 0) * 1000 / (1 + ageHours);
-}
+Tune with floors/ceilings: `max(score_floor, weighted - λ * sqrt(age))` introduces stability for governance (e.g. regulatory alerts never drop below baseline).
 
-export const getPriorityInbox = async (count: number): Promise<EvalNotification[]> => {
-  const all = await fetchExternalNotifications();
-  return all
-    .map((notif) => ({ notif, score: priorityScore(notif) }))
-    .sort((a, b) => b.score - a.score)
-    .slice(0, count)
-    .map(({ notif }) => notif);
-};
-```
+### Maintaining **top N** efficiently
 
-**`routes/notification.route.ts`** — endpoint registration:
-```typescript
-.get("/priority", getPriorityInboxHandler, {
-  query: t.Object({ n: t.Optional(t.String()) }),
-})
-```
+Streaming arrivals use a **min‑heap keyed by computed score**:
 
-### How to Maintain Top 10 Efficiently as New Notifications Arrive
+1. Maintain heap size ≤ **N**.
+2. For each arriving item compute **score**.
+3. If `heap.size < N` → insert.
+4. Else if `score > heap.min.score` → **pop min**, insert new.
+5. Else discard.
 
-The use of a min-heap to hold a max of N notifications is optimal where there are notifications streaming at us. As each new notification comes in, we check to see if its score is higher than the smallest one in the heap, and if so we discard the smallest and insert the new one. This ensures that at any given time we are only doing O(log N) operations with O(N) memory as compared to an O(M log M) sort where M>>N.
+
+**Complexity**: per insertion **`O(log N)`** vs full sort **`O(M log M)`** over **M_total** backlog.
+
+Alternatively DB query with **indexed recency cutoff** + **`ORDER BY score_expr LIMIT N`** leverages partial evaluation when **M_recent << M_history**.
+
+Handling **new notifications**: push into heap if qualifies; optionally **persist materialized ordering** ephemeral (no long-term duplication of truth).
 
 ```
-Algorithm: Online Top-N with Min-Heap
-
-Initialize: minHeap = [] (size 0)
-
-For each incoming notification n:
-  score = priorityScore(n)
-
-  if heap.size < N:
-    heap.push(n, score)          # heap not full yet — always add
-
-  else if score > heap.peek().score:
-    heap.pop()                   # evict lowest-priority item
-    heap.push(n, score)          # insert new higher-priority item
-
-  # else: score ≤ min in heap → discard, not in top N
-
-Result: heap contains top N notifications at all times
+Min-Heap invariant: smallest score at root (among top-N candidates tracked)
+incoming score > root → replace root → heapify → O(log N)
 ```
 
-**Complexity:**
-- Per notification: `O(log N)` heap operations
-- After M notifications: `O(M log N)` total
-- Space: `O(N)` — only top N stored in memory at any point
+---
 
-Compare to sort-all: `O(M log M)` time, `O(M)` space — much worse when M ≫ N.
+⸻
+
+## Architecture diagrams (compact reference)
+
+### API flow
+
+```
+Mobile/Web → HTTPS → Gateway (JWT,rates) → Service → Postgres
+                                               ↘ Redis Pub/Sub → SSE
+```
+
+### End‑to‑end notification flow
+
+```
+Create → Persist → Publish → Worker(s) Channel dispatch → Receipt logs
+                        ↘ Realtime fan‑out adapter
+```
+
+### Queue architecture & WebSocket/SSE adaptor
+
+```
+[API] ─ enqueue ─► [Queue] ─► [Workers] ─► providers
+                                   │
+                                   └──► SSE hub / WS gateway (fan-out)
+```
+
+
+---
+
+## Assumptions
+
+1. Notification **content rows are immutable** after insert; substantive edits spawn a successor record.
+2. **Unread/read** derives from **`notification_reads`** existence (sparse table).
+3. **Peak concurrent SSE** connections ≈ **15–25% daily active users** intermittently—not full enrollment simultaneously (dimension connection pools accordingly).
+4. **Clock skew bounded** (<1s); priority scoring tolerant to minor drift.
+5. Replica **lag SLA** `< 2 seconds` acceptable for inbox listing (not banking ledger).
+
+---
+
+
+## Error handling
+
+| Layer | Behavior |
+|-------|----------|
+| **API validation** | 400/422 deterministic JSON problem details; reject oversize payloads. |
+| **Auth** | `401` for stale or invalid JWT. Prefer uniform `404` for cross‑tenant resource mismatches versus selective `403` where policy dictates an explicit forbidden signal. |
+| **Transient downstream** | bounded retries exponential backoff circuits open after failure threshold propagate `503` sparingly expose `retry_after`. |
+| **Queue publish failure** | transactionally **hold** outbound row flagged `delivery_state=pending`; reconciler retries. |
+| **Worker poison message** | after **N failures** relocate **DLQ** + metric alert. |
+| **Timeouts** | client HTTP deadlines; worker processing budgets cancel partial side effects compensated via reconciliation job. |
+
+---
+
+## Security
+
+- **JWT** validation (issuer, audience, expiry, small clock leeway) plus short-lived tokens and rotating keys (JWKS).
+- **HTTPS** everywhere external; TLS between internal services preferred.
+- **Rate limiting**: per‑IP baseline, stricter quotas per authenticated student, and burst controls on internal blast endpoints.
+- **Input validation**: schema constraints on lengths and enums to block oversize payloads and mass-assignment anomalies.
+- **Least privilege**: separate DB credentials (read-only replica role for selectors; constrained writer role).
+- **Audit**: append-only `notification_batches` lineage for forensic traceability of privileged admin actions.
+
+---
+
+
+## Document revision
+
+Maintained alongside service implementation increments; Breaking API changes gated through versioned routing (`v1`,`v2`).
