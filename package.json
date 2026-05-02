@@ -1,0 +1,10 @@
+{
+  "name": "RA2311026010227-workspace",
+  "version": "1.0.0",
+  "private": true,
+  "workspaces": [
+    "logging_middleware",
+    "notification_app_be",
+    "vehicle_maintenance_scheduler"
+  ]
+}
