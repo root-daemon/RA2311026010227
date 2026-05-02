@@ -1,151 +1,242 @@
-# Notification System Design
+# System Design Document
 
 ## 1. Overview
 
-This document describes the architecture of a notification backend service built with Bun and Elysia.js. The system exposes a REST API for creating and managing notifications, with structured logging sent to an external evaluation API on every operation.
+This document covers two backend microservices:
+
+1. **notification_app_be** — REST API for creating and managing notifications
+2. **vehicle_maintenance_scheduler** — Optimization microservice that solves a 0/1 Knapsack problem to schedule vehicle maintenance tasks across depots within mechanic hour limits
+
+Both use a shared **logging_middleware** package that ships structured logs to an external evaluation API on every significant operation.
 
 ---
 
-## 2. Architecture Diagram
+## 2. notification_app_be Architecture
+
+### ASCII Diagram
 
 ```
-                         ┌─────────────────────────────────────┐
-  HTTP Client            │         notification_app_be          │
-  (Postman/curl)         │                                      │
-       │                 │  Elysia.js (port 3001)               │
-       │ HTTP request    │                                      │
-       ▼                 │  ┌─────────────────────────────┐    │
-  ─────────────          │  │  cors plugin                │    │
-       │                 │  ├─────────────────────────────┤    │
-       │                 │  │  loggingMiddleware           │    │
-       │                 │  │  onRequest / onAfterResponse │    │
-       │                 │  │  onError                    │    │
-       │                 │  ├─────────────────────────────┤    │
-       │                 │  │  notificationRoute           │    │
-       │                 │  │  POST   /notifications       │    │
-       │                 │  │  GET    /notifications       │    │
-       │                 │  │  GET    /notifications/:id   │    │
-       │                 │  │  PATCH  /notifications/:id/read│  │
-       │                 │  │  DELETE /notifications/:id   │    │
-       │                 │  └────────────┬────────────────┘    │
-       │                 │               │                      │
-       │                 │  ┌────────────▼────────────────┐    │
-       │                 │  │  NotificationController      │    │
-       │                 │  └────────────┬────────────────┘    │
-       │                 │               │                      │
-       │                 │  ┌────────────▼────────────────┐    │
-       │                 │  │  NotificationService         │    │
-       │                 │  │  (pure functions)            │    │
-       │                 │  └────────────┬────────────────┘    │
-       │                 │               │                      │
-       │                 │  ┌────────────▼────────────────┐    │
-       │                 │  │  In-Memory Store             │    │
-       │                 │  │  Notification[]              │    │
-       │                 │  └─────────────────────────────┘    │
-       │                 │                                      │
-       │                 │  ┌─────────────────────────────┐    │
-       │                 │  │  Log() — fire-and-forget     │    │
-       │                 │  └────────────┬────────────────┘    │
-       │                 └───────────────┼──────────────────────┘
-       │                                 │
-       ◄──── HTTP response               │ POST /evaluation-service/logs
-                                         ▼
-                               ┌──────────────────────┐
-                               │  External Logging API │
-                               │  20.207.122.201       │
-                               └──────────────────────┘
+  HTTP Client
+      │
+      ▼
+  Elysia.js (port 3001)
+      │
+      ├── cors plugin
+      │
+      ├── loggingMiddleware
+      │   ├── onRequest  → Log(info, middleware, "Incoming: METHOD /path")
+      │   ├── onAfterResponse → Log(info, middleware, "Completed: ... status")
+      │   └── onError    → Log(error, middleware, "Error on ...")
+      │
+      └── notificationRoute (/notifications)
+              │
+              ├── POST   /           → controller → service → store[]
+              ├── GET    /           → controller → service → store[]
+              ├── GET    /:id        → controller → service → store[]
+              ├── PATCH  /:id/read   → controller → service → store[]
+              └── DELETE /:id        → controller → service → store[]
+                                               │
+                                         Log() ──► External Logging API
+                                                   20.207.122.201
 ```
 
----
+### Request Flow — POST /notifications
 
-## 3. Request Flow — POST /notifications
+1. Client sends `POST /notifications` with `{ title, message, type }`
+2. CORS headers applied
+3. `loggingMiddleware.onRequest` fires → logs incoming request (fire-and-forget)
+4. TypeBox validates body; invalid input → `422` before handler runs
+5. `createNotificationHandler` called with destructured `{ body, set }`
+6. Handler logs `"Creating notification"` via `Log()` (fire-and-forget)
+7. `createNotification(body)` → generates UUID, pushes to in-memory array
+8. Handler logs `"Notification created: <id>"`, sets `status = 201`, returns object
+9. `loggingMiddleware.onAfterResponse` logs completion
 
-1. Client sends `POST /notifications` with JSON body `{ title, message, type }`
-2. Elysia CORS plugin adds appropriate headers
-3. `loggingMiddleware.onRequest` fires → `Log("backend", "info", "middleware", "Incoming: POST /notifications")` (fire-and-forget)
-4. TypeBox validates the body; if invalid, Elysia returns `422 Unprocessable Entity` before the handler runs
-5. `createNotificationHandler` is called with destructured `{ body, set }`
-6. Handler fires `Log("backend", "info", "controller", "Creating notification")` (fire-and-forget)
-7. Handler calls `createNotification(body)` → service creates a `Notification` object with `crypto.randomUUID()` and pushes to the in-memory array
-8. Handler fires `Log("backend", "info", "controller", "Notification created: <id>")` (fire-and-forget)
-9. Handler sets `set.status = 201` and returns the new notification object
-10. `loggingMiddleware.onAfterResponse` fires → `Log("backend", "info", "middleware", "Completed: POST /notifications 201")`
-11. Client receives `201 Created` with the notification JSON
+### Notification Data Model
 
----
-
-## 4. In-Memory Data Model
-
-### Notification
-
-| Field       | Type                        | Description                                 |
-|-------------|-----------------------------|---------------------------------------------|
-| `id`        | `string` (UUID)             | Unique identifier, generated via `crypto.randomUUID()` |
-| `title`     | `string`                    | Short heading for the notification          |
-| `message`   | `string`                    | Full notification body text                 |
-| `type`      | `"info" \| "warn" \| "error"` | Severity/category of the notification     |
-| `read`      | `boolean`                   | Whether the notification has been read; defaults to `false` |
-| `createdAt` | `string` (ISO 8601)         | Timestamp of creation                       |
-
-Storage: `const notifications: Notification[] = []` — a module-level mutable array shared across all requests within the same process.
+| Field | Type | Description |
+|-------|------|-------------|
+| `id` | `string` (UUID) | `crypto.randomUUID()` |
+| `title` | `string` | Short heading |
+| `message` | `string` | Body text |
+| `type` | `"info" \| "warn" \| "error"` | Severity |
+| `read` | `boolean` | Default `false` |
+| `createdAt` | `string` (ISO 8601) | Creation timestamp |
 
 ---
 
-## 5. Logging Strategy
+## 3. vehicle_maintenance_scheduler Architecture
 
-Every significant operation emits a structured log via `Log(stack, level, packageName, message)`. Logs are fire-and-forget (`void Log(...)`) so they never block the request cycle.
+### Problem Statement
 
-| Layer       | Package name   | Level   | When                                      |
-|-------------|----------------|---------|-------------------------------------------|
-| Middleware  | `middleware`   | `info`  | On every incoming request                 |
-| Middleware  | `middleware`   | `info`  | After every completed response            |
-| Middleware  | `middleware`   | `error` | On unhandled errors                       |
-| Controller  | `controller`   | `info`  | At the start of each handler              |
-| Controller  | `controller`   | `info`  | After a successful create/delete          |
-| Controller  | `controller`   | `warn`  | When a resource is not found              |
-| Cron job    | `cron_job`     | `warn`  | When a vehicle is due for maintenance     |
-| Cron job    | `cron_job`     | `info`  | After each maintenance check sweep        |
-| Route       | `route`        | `info`  | On vehicle CRUD operations                |
-| Route       | `route`        | `warn`  | When a vehicle is not found               |
+Given a set of maintenance tasks (each with a `Duration` in hours and an `Impact` score) and a set of depots (each with a `MechanicHours` budget), compute the optimal subset of tasks for each depot that **maximizes total Impact without exceeding MechanicHours**.
 
-All logs use `stack: "backend"`.
+This is a classic **0/1 Knapsack Problem**:
+- Weight = `Duration`
+- Value = `Impact`
+- Capacity = `MechanicHours`
+
+### ASCII Diagram
+
+```
+  HTTP Client
+      │
+      ▼
+  Elysia.js (port 3002)
+      │
+      ├── cors plugin
+      │
+      ├── maintenanceCron (every minute)
+      │   └── checks in-memory vehicles, logs warn if due within 7 days
+      │
+      ├── vehicleRoute (/vehicles)
+      │   ├── POST /         → addVehicle (in-memory CRUD)
+      │   ├── GET  /         → listVehicles
+      │   └── PUT  /:id/service → recordService (reset lastServiceDate)
+      │
+      └── scheduleRoute (/schedule)
+              │
+              ├── GET /
+              │     │
+              │     ├── fetchDepots() ──► GET /evaluation-service/depots
+              │     ├── fetchVehicles() ► GET /evaluation-service/vehicles
+              │     │
+              │     └── for each depot:
+              │           knapsack(tasks, depot.MechanicHours)
+              │           → { selectedTasks, totalImpact, totalDuration }
+              │
+              └── GET /:depotId
+                    │
+                    ├── fetchDepots() + fetchVehicles() (parallel)
+                    ├── find depot by ID
+                    └── knapsack(tasks, depot.MechanicHours)
+```
+
+### Optimization Flow
+
+```
+fetchDepots()  ──┐
+                 ├── Promise.all → [depots, tasks]
+fetchVehicles() ─┘
+                        │
+              for each depot:
+                        │
+              ┌─────────▼──────────────────────────────────────┐
+              │  0/1 Knapsack DP                                │
+              │                                                  │
+              │  dp[i][w] = max impact using first i tasks      │
+              │             within capacity w                    │
+              │                                                  │
+              │  Fill table: O(n * W)                           │
+              │  Traceback:  O(n)                               │
+              │  Total:      O(n * W) time, O(n * W) space      │
+              └─────────────────────────────────────────────────┘
+                        │
+              { selectedTasks, totalImpact, totalDuration }
+```
+
+### Schedule Response Schema
+
+```json
+{
+  "depotId": 2,
+  "mechanicHours": 135,
+  "totalImpact": 187,
+  "totalDuration": 134,
+  "selectedTasks": [
+    { "TaskID": "uuid", "Duration": 4, "Impact": 7 }
+  ]
+}
+```
+
+### Complexity Analysis
+
+| Metric | Value |
+|--------|-------|
+| Algorithm | 0/1 Knapsack (Bottom-up DP) |
+| Time complexity | O(n × W) per depot |
+| Space complexity | O(n × W) |
+| n (tasks) | ~30–40 (from live API) |
+| W (max hours) | ~200 |
+| Operations per depot | ~8,000 |
+| Suitable for | Real-world scale — handles thousands of tasks efficiently |
+
+Brute-force would be O(2^n) — infeasible at n=40 (2^40 ≈ 1 trillion operations). DP reduces this to O(n×W) which is sub-10K operations for this dataset.
 
 ---
 
-## 6. Error Handling
+## 4. Logging Strategy
 
-**TypeBox validation (422):** Elysia validates request body, query, and params against TypeBox schemas before the handler runs. Invalid input returns a `422 Unprocessable Entity` with details automatically — no handler code needed.
+All services use `Log(stack, level, packageName, message)` from `@local/logging-middleware`.
 
-**Not found (404):** Handlers check service return values. When a resource is not found, the handler sets `set.status = 404` and returns `{ error: "..." }`. No exceptions are thrown.
+| Layer | Package | Level | Event |
+|-------|---------|-------|-------|
+| Middleware | `middleware` | `info` | Every incoming request |
+| Middleware | `middleware` | `info` | Every completed response |
+| Middleware | `middleware` | `error` | Unhandled errors |
+| Controller | `controller` | `info` | Handler invoked |
+| Controller | `controller` | `warn` | Resource not found |
+| Service | `service` | `info` | Optimization start/complete |
+| Service | `service` | `warn` | Depot not found |
+| Handler | `handler` | `info` | External API fetch start/complete |
+| Handler | `handler` | `error` | External API failure |
+| Route | `route` | `info` | Route hit |
+| Cron | `cron_job` | `info` | Sweep complete |
+| Cron | `cron_job` | `warn` | Vehicle due for maintenance |
 
-**Log() failures:** `Log()` wraps its `fetch()` call in a `try/catch`. Failures are printed to `console.error` and swallowed — the logging API being unavailable never affects the application's own responses.
-
-**Unhandled errors:** `loggingMiddleware.onError` catches any unhandled Elysia errors, logs them at `error` level, and lets Elysia return its default error response.
+All `Log()` calls are fire-and-forget (`void Log(...)`) — logging failures never block request processing.
 
 ---
 
-## 7. Retry and Resilience Strategy
+## 5. Error Handling
 
-**Current approach (in-memory, evaluation scope):**
-- `Log()` does not retry. If the logging API is temporarily down, the log entry is lost silently. Acceptable for evaluation; not for production.
-- In-memory store has no persistence. Data is lost on process restart. This is intentional for a stateless evaluation service.
+| Scenario | Behavior |
+|----------|----------|
+| Invalid request body | TypeBox returns `422` automatically before handler runs |
+| Resource not found | Handler sets `set.status = 404`, returns `{ error: "..." }` |
+| External API auth failure | `fetchDepots/fetchVehicles` throws, caught at route, returns `500` |
+| Depot ID not in current set | Returns `404` with `{ error: "...", availableDepots: [...] }` |
+| `Log()` network failure | Swallowed silently — app continues normally |
+
+---
+
+## 6. API Interaction Notes
+
+The evaluation API returns **dynamic data** — depot IDs and task lists change on every call. Implications:
+
+- `GET /schedule` always works — fetches fresh data and processes all current depots
+- `GET /schedule/:depotId` — if the ID isn't in the current response, returns a `404` with the currently available depot IDs in `availableDepots[]`
+- Both depots and vehicles are fetched in a single `Promise.all` per request to minimize API round-trips and keep data consistent within one optimization run
+
+---
+
+## 7. Retry and Resilience
+
+**Current (evaluation scope):**
+- No retry on external API failures — a single failure returns `500`
+- No data persistence — in-memory store resets on restart
+- `Log()` swallows failures silently
 
 **Production upgrade path:**
-- Replace `notifications: Notification[]` with a Postgres/Redis-backed repository. The service layer interface stays the same — only `db/store.ts` changes.
-- Add retry logic in `Log()` with exponential backoff and a dead-letter queue for failed log entries.
-- Use a message queue (e.g., BullMQ, RabbitMQ) to decouple notification creation from delivery.
+- Exponential backoff + retry on external API calls (e.g. 3 retries with jitter)
+- Redis cache for depot/vehicle data (TTL: 30s) to reduce API pressure
+- Persistent DB for notification store
+- Dead-letter queue for failed log entries
 
 ---
 
 ## 8. Scalability Notes
 
-**Horizontal scaling limitations:**
-- The in-memory store is local to each process instance. Running multiple instances means each has its own independent state — requests routed to different instances will see different notification lists.
+**In-memory store limitations:**
+- State is per-process — horizontal scaling requires a shared store (Redis, Postgres)
+- Vehicle/notification data is lost on restart
 
-**Migration path:**
-- **Database**: Replace the in-memory array with a Postgres table or Redis sorted set behind the service interface.
-- **Session stickiness**: Use a load balancer with sticky sessions as an intermediate step before migrating to a real DB.
-- **CORS**: Current config uses wildcard (`*`). In production, restrict to known client origins: `cors({ origin: ['https://your-domain.com'] })`.
+**Knapsack at scale:**
+- O(n × W) scales well: 1000 tasks × 10000 hours = 10M ops — still milliseconds
+- For larger datasets, consider fractional relaxation or greedy approximation as a pre-filter
 
-**vehicle_maintenance_scheduler scaling:**
-- The cron job runs per-instance. With multiple instances, multiple cron sweeps will fire simultaneously — use a distributed lock (e.g., Redis `SETNX`) to ensure only one instance runs the sweep per interval.
+**Cron at scale:**
+- One cron fires per process — use a distributed lock (Redis `SETNX`) to prevent duplicate sweeps across replicas
+
+**CORS:**
+- Currently `*` (open) — restrict to known origins in production
