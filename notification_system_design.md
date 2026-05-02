@@ -242,7 +242,6 @@ The evaluation API returns **dynamic data** — depot IDs and task lists change 
 - Currently `*` (open) — restrict to known origins in production
 
 ---
-
 # Stage 1
 
 ## REST API Design
@@ -322,9 +321,7 @@ Response 200:
 
 ### Real-Time Notification Design
 
-**Chosen mechanism: Server-Sent Events (SSE)**
-
-SSE is preferred over raw WebSocket for one-directional server-push (notifications are server → client only). It uses a standard HTTP connection, supports automatic reconnect, and works through proxies without extra setup.
+When dealing with notifications that come in real-time, the preferred option is SSE over pure WebSockets because notifications only come one direction: from server to client. SSE is backed by HTTP, offers automatic re-connection and runs transparently behind proxies without additional configuration.
 
 **SSE Endpoint:**
 ```
@@ -376,18 +373,9 @@ Server → { "event": "notification", "data": { ... } }
 
 ### Choice: PostgreSQL
 
-**Why PostgreSQL:**
-- ACID compliance — critical for "exactly once" notification delivery guarantees
-- Supports JSONB for flexible message metadata without schema migration
-- Native `ENUM` type for notification categories
-- Row-level locking for safe concurrent `mark_as_read` updates
-- Mature ecosystem (pgBouncer for connection pooling, PgBouncer, read replicas)
-- `LISTEN/NOTIFY` for lightweight internal pub-sub without Redis dependency
+We picked PostgreSQL because it offers ACID compliance and because we needed a system that guaranteed exact once notification delivery. PostgreSQL's JSONB column makes it trivial to store varied notification metadata without any need for schema migrations, and it has an ENUM type built into the database for notification categories. Row-level locks enable concurrency read updates to be performed safely, and its large ecosystem support for connection pooling and read replicas are invaluable. PostgreSQL also offers a native LISTEN/NOTIFY, which allows for lightweight internal pub/sub without Redis.
 
-**Why not NoSQL (MongoDB, DynamoDB):**
-- No multi-document ACID for mass inserts with audit trail
-- Eventual consistency risks duplicate notification display
-- Weaker query flexibility for complex filters + pagination
+We ruled out NoSQL alternatives like MongoDB and DynamoDB because they are not capable of providing ACID for multiple writes in a single transaction (necessary for bulk inserting records while maintaining audit trail) and they do not support eventual consistency as safely; an event arriving late to an already delivered notification could easily cause a duplicate display. They are also significantly more limited in terms of flexible query power for combine searches with pagination.
 
 ### Schema
 
@@ -504,13 +492,7 @@ Functionally correct — returns unread notifications for student 1042 in revers
 
 ### Why Is It Slow?
 
-Without the composite index, Postgres performs a **sequential scan** of the entire `notifications` table:
-1. Read every row from disk (I/O bound on large tables)
-2. Filter rows where `studentID = 1042` (CPU: evaluate predicate on every row)
-3. Filter again for `isRead = false` (second pass or in-line)
-4. Sort all matching rows by `createdAt DESC` (sort in temp memory or disk if large)
-
-On a table with 10 million rows, even if only 50 belong to student 1042, Postgres reads all 10 million rows before finding them.
+Without an index, when performing a notification search with just a WHERE student_id = X clause, PostgreSQL scans the entire notifications table (all ten million rows from disk), filters for the matching student ID, filters for the unread status, sorts the results and presents them.
 
 ### Computational Cost
 
@@ -529,6 +511,8 @@ With the composite index `(studentID, isRead, createdAt DESC)`:
 
 ### Why Indexing Every Column Is Bad
 
+Creating an index for every single column on the other hand is terrible: all writes now require writing to N indexes where N is the number of indexes. Each index takes up a full copy of the column it is indexing on disk. The vacuum process of PostgreSQL must walk through and clean out dead tuples from every index, proportional to the number of indexes it's working on. Furthermore, too many indexes lead the planner to examine far too many different query plans and therefore spend too much time planning! The rule is to only index columns in WHERE clauses, ORDER BY clauses or JOIN clauses in frequent queries in the order they appear.
+
 | Concern | Detail |
 |---------|--------|
 | **Write amplification** | Every `INSERT`/`UPDATE`/`DELETE` must update every index. 10 indexes = 10x write overhead. |
@@ -536,8 +520,6 @@ With the composite index `(studentID, isRead, createdAt DESC)`:
 | **Vacuum overhead** | Postgres VACUUM must clean dead tuples in every index — proportional to index count. |
 | **Query planner confusion** | Too many indexes force the planner to evaluate more execution plans, slowing planning time. |
 | **Rarely used** | A column queried alone without the right selectivity won't be used anyway — wasted space. |
-
-**Rule:** Index only columns that appear in `WHERE`, `ORDER BY`, or `JOIN ON` clauses in frequent queries, in the order they are used.
 
 ### Query: Students with Placement Notification in Last 7 Days
 
@@ -585,14 +567,11 @@ WHERE student_id = $1 AND created_at < $cursor
 ORDER BY created_at DESC LIMIT 20;
 ```
 
-**Why cursor over OFFSET:** `OFFSET N` requires Postgres to scan and discard N rows. Cursor jumps directly via the index. At page 500 with limit 20, `OFFSET 10000` scans 10,020 rows; cursor scans 20.
+Cursor-based pagination is better than offset-based because OFFSET reads and discards all previous pages from disk while cursor pagination simply skips past previous indexes. Therefore for page 500 with a limit of 20, an OFFSET pagination call will scan 10000+19 rows while the cursor-based pagination would just walk through the indexes.
 
 #### 3. SSE / WebSocket Push Instead of Polling
 
-Replace client polling (`setInterval → GET /notifications`) with a persistent SSE connection. Server pushes new notifications as they arrive — zero redundant DB hits between events.
-
-**Polling problem:** 1000 students polling every 5s = 200 req/s of empty responses hitting the DB.
-**SSE solution:** 1000 persistent connections, 0 DB hits when nothing changed.
+The main drawback of clients polling a notification service every few seconds is the massive number of unnecessary read calls hitting the database: 1000 students polling every 5 seconds results in 200 calls per second mostly just returning that there are no notifications for a student. Using a persistent SSE connection is ideal as notifications are pushed when the server sees fit and are therefore never read from the database when no notification exists.
 
 #### 4. Redis Pub/Sub for SSE Fan-Out
 
@@ -607,7 +586,8 @@ No polling. Sub-100ms delivery. Horizontally scalable (any SSE server instance r
 
 #### 5. Denormalization: Unread Count Cache
 
-Instead of `SELECT COUNT(*) WHERE is_read = false` on every request:
+By creating a summary table and duplicating the unread count within this table we turn our potentially slow COUNT query into a fast O(1) lookup. The only tradeoff is that this requires two writes, but a regular background job to reconcile the counter helps overcome potential drift caused by an atomic failure mid-write.
+
 ```sql
 CREATE TABLE notification_counts (
   student_id  BIGINT PRIMARY KEY,
@@ -615,8 +595,6 @@ CREATE TABLE notification_counts (
 );
 -- Increment on INSERT, decrement on mark_as_read (via trigger or application logic)
 ```
-
-**Tradeoff:** Read `O(1)` lookup. Write requires two updates (notifications + counts). Risk of counter drift on failed transactions — fix with periodic reconciliation job.
 
 #### 6. Read Replicas
 
@@ -654,6 +632,8 @@ function notify_all(student_ids, message):
 
 ### Shortcomings
 
+The original pseudocode has multiple flaws: all operations occur synchronously in a sequential loop, meaning 10,000 students multiplied by three operations = 30,000 disk IO calls in serial at 50ms per IO will take over 25 minutes and keep the calling thread locked. Any one error causes the whole function to fail and prevent any notification from being sent to any subsequent student. Idempotency is missing so retrying this will create duplicate notifications and database entries. No retry logic means failed attempts are never recovered. Also email, DB write, push notification are all performed in one execution context so a slow email server blocks all other operations completely.
+
 | Problem | Detail |
 |---------|--------|
 | **Synchronous serial loop** | 10,000 students × 3 operations = 30,000 sequential I/O calls. At 50ms each → 25 minutes. The caller blocks the entire time. |
@@ -678,6 +658,8 @@ function notify_all(student_ids, message):
 This makes the entire operation safe to retry from any point.
 
 ### Redesigned Architecture
+
+The refactored architecture addresses all these issues by first bulk-inserting all queued notifications into the database and then queuing each individual message on a message queue that the worker threads will read from. Returning quickly to the caller ensures responsiveness of the original request. Async workers will process notifications on the queue in parallel with an idempotency check being performed before any other action is taken. When a message is encountered that fails it is re-queued with exponential backoff. After N retries the notification is added to a Dead Letter Queue where it will be handled by human operators or re-sent.
 
 ```
 notify_all(student_ids, message)
@@ -787,7 +769,7 @@ Authorization: Bearer <token>
 
 ### Scoring Formula
 
-Importance is a function of **type weight** and **recency**:
+The scoring formula weights notifications by type and applies negative weighting by age, so a notification is scored based on both importance and timeliness. A fresh notification with high importance will score highly over a stale one with high importance and a notification with extreme importance even over a fresh one with low importance due to recency weighting!
 
 ```
 priority_score = type_weight × 1000 / (1 + age_in_hours)
@@ -799,11 +781,7 @@ priority_score = type_weight × 1000 / (1 + age_in_hours)
 | Result | 2 |
 | Event | 1 |
 
-A fresh Placement scores `3000 / 1 = 3000`. A Placement from 24 hours ago scores `3000 / 25 = 120`. A fresh Event scores `1000 / 1 = 1000`. This means type weight dominates for recent notifications, but an extremely old Placement can be outranked by a fresh Event — recency matters.
-
 ### Implementation
-
-The actual code lives in the running service at `notification_app_be/src/`:
 
 **`services/notification.service.ts`** — scoring + sorting:
 ```typescript
@@ -833,7 +811,7 @@ export const getPriorityInbox = async (count: number): Promise<EvalNotification[
 
 ### How to Maintain Top 10 Efficiently as New Notifications Arrive
 
-Fetching all and sorting is fine for batch requests (`O(M log M)`). For a live streaming scenario where notifications arrive one at a time, a **min-heap of size N** is optimal:
+The use of a min-heap to hold a max of N notifications is optimal where there are notifications streaming at us. As each new notification comes in, we check to see if its score is higher than the smallest one in the heap, and if so we discard the smallest and insert the new one. This ensures that at any given time we are only doing O(log N) operations with O(N) memory as compared to an O(M log M) sort where M>>N.
 
 ```
 Algorithm: Online Top-N with Min-Heap
@@ -861,5 +839,3 @@ Result: heap contains top N notifications at all times
 - Space: `O(N)` — only top N stored in memory at any point
 
 Compare to sort-all: `O(M log M)` time, `O(M)` space — much worse when M ≫ N.
-
-A min-heap ensures that the lowest-priority item in the top N is always at the root, making the "should I evict?" check `O(1)` and the evict+insert `O(log N)`.
