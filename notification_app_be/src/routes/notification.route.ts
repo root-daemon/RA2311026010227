@@ -3,16 +3,24 @@ import {
   createNotificationHandler,
   deleteNotificationHandler,
   getNotificationHandler,
+  getPriorityInboxHandler,
   listNotificationsHandler,
   markAsReadHandler,
 } from "../controllers/notification.controller.ts";
 
 export const notificationRoute = new Elysia({ prefix: "/notifications" })
+  .get("/priority", getPriorityInboxHandler, {
+    query: t.Object({ n: t.Optional(t.String()) }),
+  })
   .post("/", createNotificationHandler, {
     body: t.Object({
       title: t.String({ minLength: 1 }),
       message: t.String({ minLength: 1 }),
-      type: t.Union([t.Literal("info"), t.Literal("warn"), t.Literal("error")]),
+      type: t.Union([
+        t.Literal("Placement"),
+        t.Literal("Result"),
+        t.Literal("Event"),
+      ]),
     }),
   })
   .get("/", listNotificationsHandler, {

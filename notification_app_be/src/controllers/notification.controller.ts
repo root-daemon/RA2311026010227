@@ -3,6 +3,7 @@ import {
   createNotification,
   deleteNotification,
   getNotificationById,
+  getPriorityInbox,
   listNotifications,
   markAsRead,
 } from "../services/notification.service.ts";
@@ -85,4 +86,24 @@ export const deleteNotificationHandler = async ({
   }
   void Log("backend", "info", "controller", `Notification deleted: ${params.id}`);
   return { success: true };
+};
+
+export const getPriorityInboxHandler = async ({
+  query,
+  set,
+}: {
+  query: { n?: string };
+  set: Set;
+}) => {
+  void Log("backend", "info", "controller", "Fetching priority inbox");
+  const n = Math.min(Number(query.n ?? 10), 100);
+  try {
+    const result = await getPriorityInbox(n);
+    void Log("backend", "info", "controller", `Priority inbox returned ${result.length} items`);
+    return { notifications: result };
+  } catch (err) {
+    void Log("backend", "error", "controller", `Priority inbox failed: ${err}`);
+    set.status = 502;
+    return { error: "Failed to fetch notifications from upstream" };
+  }
 };
