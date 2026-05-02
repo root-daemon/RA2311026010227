@@ -521,7 +521,7 @@ Architecture sketch:
 
 ### Async workers & event‑driven design
 
-Orchestration is **event‑driven**: campaign accepted → partitioned topics by `shard(student_id)` for ordered per‑student processing.**Competing consumers** improve throughput.**Idempotent consumers** reconcile with DB state.
+Orchestration stays **event‑driven**: an accepted campaign fans out into topics partitioned by `shard(student_id)` so per‑student ordering can be preserved. **Competing consumer** pools raise throughput while **idempotent consumers** reconcile with durable DB checkpoints.
 
 
 ### Idempotency
@@ -663,7 +663,7 @@ Create → Persist → Publish → Worker(s) Channel dispatch → Receipt logs
 |-------|----------|
 | **API validation** | 400/422 deterministic JSON problem details; reject oversize payloads. |
 | **Auth** | `401` for stale or invalid JWT. Prefer uniform `404` for cross‑tenant resource mismatches versus selective `403` where policy dictates an explicit forbidden signal. |
-| **Transient downstream** | bounded retries exponential backoff circuits open after failure threshold propagate `503` sparingly expose `retry_after`. |
+| **Transient downstream** | Bounded exponential backoff with circuit breaking; propagate `503` sparingly with `Retry-After` hints when overloaded. |
 | **Queue publish failure** | transactionally **hold** outbound row flagged `delivery_state=pending`; reconciler retries. |
 | **Worker poison message** | after **N failures** relocate **DLQ** + metric alert. |
 | **Timeouts** | client HTTP deadlines; worker processing budgets cancel partial side effects compensated via reconciliation job. |
