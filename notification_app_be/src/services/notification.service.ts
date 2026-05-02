@@ -1,4 +1,4 @@
-import { notifications } from "../db/store.ts";
+import { stmts, toNotification } from "../db/store.ts";
 import type { EvalNotification, Notification } from "../types/index.ts";
 import { fetchExternalNotifications } from "../api/client.ts";
 
@@ -18,31 +18,32 @@ export const createNotification = (
     read: false,
     createdAt: new Date().toISOString(),
   };
-  notifications.push(notification);
+  stmts.insert.run(
+    notification.id, notification.title, notification.message,
+    notification.type, 0, notification.createdAt
+  );
   return notification;
 };
 
 export const listNotifications = (read?: boolean): Notification[] => {
-  if (read === undefined) return notifications;
-  return notifications.filter((n) => n.read === read);
+  if (read === undefined) return stmts.findAll.all().map(toNotification);
+  return stmts.findByRead.all(read ? 1 : 0).map(toNotification);
 };
 
-export const getNotificationById = (id: string): Notification | undefined =>
-  notifications.find((n) => n.id === id);
+export const getNotificationById = (id: string): Notification | undefined => {
+  const row = stmts.findById.get(id);
+  return row ? toNotification(row) : undefined;
+};
 
 export const markAsRead = (id: string): Notification | null => {
-  const n = notifications.find((n) => n.id === id);
-  if (!n) return null;
-  n.read = true;
-  return n;
+  const existing = stmts.findById.get(id);
+  if (!existing) return null;
+  stmts.markRead.run(id);
+  return toNotification({ ...existing, read: 1 });
 };
 
-export const deleteNotification = (id: string): boolean => {
-  const idx = notifications.findIndex((n) => n.id === id);
-  if (idx === -1) return false;
-  notifications.splice(idx, 1);
-  return true;
-};
+export const deleteNotification = (id: string): boolean =>
+  stmts.deleteById.run(id).changes > 0;
 
 export const getExternalNotifications = (): Promise<EvalNotification[]> =>
   fetchExternalNotifications();

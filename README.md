@@ -9,6 +9,7 @@ A backend system built with **Bun**, **Elysia.js**, and **TypeScript**, structur
 - **Runtime:** Bun
 - **Framework:** Elysia.js
 - **Language:** TypeScript
+- **Database:** SQLite via `bun:sqlite` (built-in, no extra dependency)
 - **Architecture:** Layered (Controller → Service → Store)
 - **Algorithm:** 0/1 Knapsack (Dynamic Programming) — O(n × W)
 
@@ -18,14 +19,16 @@ A backend system built with **Bun**, **Elysia.js**, and **TypeScript**, structur
 
 ```
 RA2311026010227/
-├── logging_middleware/           Reusable Log() package (@local/logging-middleware)
-├── notification_app_be/          Notification REST API — port 3001
+├── logging_middleware/            Reusable Log() package (@local/logging-middleware)
+├── notification_app_be/           Notification REST API — port 3001
+│   └── data/notifications.db      SQLite database (auto-created on first run)
 ├── vehicle_maintenance_scheduler/ Optimization microservice — port 3002
+│   └── data/vehicles.db           SQLite database (auto-created on first run)
 ├── notification_system_design.md  System architecture + algorithm design
 ├── scripts/
-│   ├── register.ts               One-time registration
-│   └── auth.ts                   Fetch access token
-└── screenshots/                  API screenshots
+│   ├── register.ts                One-time registration
+│   └── auth.ts                    Fetch access token
+└── screenshots/                   API screenshots
 ```
 
 ---
@@ -84,6 +87,7 @@ bun run notification_app_be/src/server.ts
 | `POST` | `/notifications` | Create a notification |
 | `GET` | `/notifications` | List all (optional `?read=true/false`) |
 | `GET` | `/notifications/:id` | Get by ID |
+| `GET` | `/notifications/priority` | Priority inbox from upstream (optional `?n=<count>`) |
 | `PATCH` | `/notifications/:id/read` | Mark as read |
 | `DELETE` | `/notifications/:id` | Delete |
 
@@ -114,8 +118,8 @@ bun run vehicle_maintenance_scheduler/src/server.ts
 
 | Method | Route | Description |
 |--------|-------|-------------|
-| `POST` | `/vehicles` | Add a vehicle to the in-memory tracker |
-| `GET` | `/vehicles` | List all tracked vehicles |
+| `POST` | `/vehicles` | Add a vehicle |
+| `GET` | `/vehicles` | List all vehicles |
 | `PUT` | `/vehicles/:id/service` | Record a service (resets `lastServiceDate` to today) |
 
 ### How it works
@@ -170,6 +174,43 @@ dp[i][w] = max(dp[i-1][w], dp[i-1][w - Duration(i)] + Impact(i))
 | Time complexity | O(n × W) |
 | Space complexity | O(n × W) |
 | vs brute-force | O(2^n) → infeasible at n=40 |
+
+---
+
+## Storage
+
+Both services use **`bun:sqlite`** — Bun's built-in SQLite driver. No extra packages required.
+
+| Service | DB file | Tables |
+|---------|---------|--------|
+| notification_app_be | `data/notifications.db` | `notifications` |
+| vehicle_maintenance_scheduler | `data/vehicles.db` | `vehicles` |
+
+Databases are created automatically on first run. Data persists across restarts.
+
+**notifications schema:**
+```sql
+CREATE TABLE notifications (
+  id        TEXT    PRIMARY KEY,
+  title     TEXT    NOT NULL,
+  message   TEXT    NOT NULL,
+  type      TEXT    NOT NULL CHECK(type IN ('Placement','Result','Event')),
+  read      INTEGER NOT NULL DEFAULT 0,
+  createdAt TEXT    NOT NULL
+);
+CREATE INDEX idx_notifications_read ON notifications(read);
+```
+
+**vehicles schema:**
+```sql
+CREATE TABLE vehicles (
+  id                  TEXT    PRIMARY KEY,
+  name                TEXT    NOT NULL,
+  plateNumber         TEXT    NOT NULL UNIQUE,
+  lastServiceDate     TEXT    NOT NULL,
+  serviceIntervalDays INTEGER NOT NULL CHECK(serviceIntervalDays >= 1)
+);
+```
 
 ---
 

@@ -1,19 +1,22 @@
-import { vehicles } from "../data/vehicles.ts";
+import { stmts } from "../data/vehicles.ts";
 import type { Vehicle } from "../data/vehicles.ts";
 
-export const listVehicles = (): Vehicle[] => vehicles;
+export const listVehicles = (): Vehicle[] =>
+  stmts.findAll.all() as Vehicle[];
 
-export const addVehicle = (
-  data: Omit<Vehicle, "id">
-): Vehicle => {
+export const addVehicle = (data: Omit<Vehicle, "id">): Vehicle => {
   const vehicle: Vehicle = { id: crypto.randomUUID(), ...data };
-  vehicles.push(vehicle);
+  stmts.insert.run(
+    vehicle.id, vehicle.name, vehicle.plateNumber,
+    vehicle.lastServiceDate, vehicle.serviceIntervalDays
+  );
   return vehicle;
 };
 
 export const recordService = (id: string): Vehicle | null => {
-  const v = vehicles.find((v) => v.id === id);
-  if (!v) return null;
-  v.lastServiceDate = new Date().toISOString().split("T")[0];
-  return v;
+  const existing = stmts.findById.get(id) as Vehicle | null;
+  if (!existing) return null;
+  const today = new Date().toISOString().split("T")[0];
+  stmts.updateService.run(today, id);
+  return { ...existing, lastServiceDate: today };
 };
