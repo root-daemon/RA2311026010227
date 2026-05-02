@@ -177,6 +177,29 @@ dp[i][w] = max(dp[i-1][w], dp[i-1][w - Duration(i)] + Impact(i))
 
 ---
 
+## Caching
+
+Both services cache external API responses in-memory using a **Stale-While-Revalidate (SWR)** strategy with single-flight coalescing.
+
+| Window | Duration | Behaviour |
+|--------|----------|-----------|
+| Fresh | 30 seconds | Cached response returned immediately, no upstream call |
+| Stale | 5 minutes | Cached response returned immediately, background revalidation triggered |
+| Expired | after 5 min | Blocks on a fresh upstream fetch |
+
+**Single-flight coalescing** — if multiple requests arrive simultaneously while the cache is expired, only one upstream call is made; all waiting requests resolve from the same result. Prevents thundering herd against the evaluation service.
+
+Configured via environment variables:
+
+```
+CACHE_FRESH_MS=30000    # 30 seconds
+CACHE_STALE_MS=300000   # 5 minutes
+```
+
+This is why external-API-dependent endpoints (`/notifications/priority`, `/schedule`) average ~67ms on a cold call but are sub-millisecond when the cache is warm.
+
+---
+
 ## Storage
 
 Both services use **`bun:sqlite`** — Bun's built-in SQLite driver. No extra packages required.
